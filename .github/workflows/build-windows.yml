@@ -14,20 +14,13 @@ jobs:
           rustup default 1.97.1
       - name: Build release
         run: cargo build --release -p csqtt-desktop
-      - name: Fetch wintun.dll
+      - name: Verify embedded wintun
         shell: pwsh
         run: |
-          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
-          Expand-Archive wintun.zip -DestinationPath wintun-dist
-          $dll = Get-ChildItem -Path wintun-dist -Recurse -Filter wintun.dll |
-            Where-Object { $_.FullName -match '(?i)(amd64|x64)' } |
-            Select-Object -First 1
-          if (-not $dll) { Write-Error 'wintun.dll (x64/amd64) not found in archive'; exit 1 }
-          Copy-Item $dll.FullName target/release/wintun.dll
-          if (-not (Test-Path target/release/wintun.dll)) { Write-Error 'wintun.dll missing after copy'; exit 1 }
+          if (-not (Test-Path target/release/csqtt-desktop.exe)) { Write-Error 'exe missing'; exit 1 }
+          if (-not (Test-Path gui/assets/wintun.dll)) { Write-Error 'gui/assets/wintun.dll missing (встроен в exe)'; exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: csqtt-desktop-win64
-          path: |
-            target/release/csqtt-desktop.exe
-            target/release/wintun.dll
+          path: target/release/csqtt-desktop.exe
+          if-no-files-found: error
