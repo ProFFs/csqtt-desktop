@@ -1,0 +1,31 @@
+name: build-windows
+on:
+  workflow_dispatch:
+  push:
+    branches: [desktop]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain 1.97.1 (MSVC)
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - name: Build release
+        run: cargo build --release -p csqtt-desktop
+      - name: Fetch wintun.dll
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun-dist
+          Get-ChildItem -Path wintun-dist -Recurse -Filter wintun.dll |
+            Where-Object { $_.FullName -match 'x64' } |
+            Select-Object -First 1 |
+            ForEach-Object { Copy-Item $_.FullName target/release/wintun.dll }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: csqtt-desktop-win64
+          path: |
+            target/release/csqtt-desktop.exe
+            target/release/wintun.dll
