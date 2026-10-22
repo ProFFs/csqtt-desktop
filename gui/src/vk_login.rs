@@ -170,7 +170,7 @@ mod imp {
                 if let Some(args) = args {
                     let mut uri = PWSTR::null();
                     if args.Uri(&mut uri).is_ok() {
-                        if let Some(uri) = uri.to_string() {
+                        if let Ok(uri) = uri.to_string() {
                             if let Some(tok) = extract_token(&uri) {
                                 state.captured.store(true, Ordering::SeqCst);
                                 let _ = tx_nav.send(Ok(tok));
@@ -196,7 +196,7 @@ mod imp {
                 if let Some(args) = args {
                     let mut uri = PWSTR::null();
                     if args.Uri(&mut uri).is_ok() {
-                        if let Some(uri) = uri.to_string() {
+                        if let Ok(uri) = uri.to_string() {
                             let _ = wv2.Navigate(&HSTRING::from(uri));
                             let _ = args.SetHandled(true);
                         }
