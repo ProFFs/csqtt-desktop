@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -61,6 +61,8 @@ const DEFAULT_CLIENT_IDS: &str = "8202606,6287487";
 const LISTEN: &str = "127.0.0.1:9000";
 const WORKERS_PER_GROUP: usize = 9;
 const MAX_VK_HASHES: usize = 6;
+// Единый внутренний отступ секционных карточек (AppSectionCard padding).
+const SP: i8 = 16;
 
 // ───────────────────────────── утилиты ─────────────────────────────
 
@@ -146,6 +148,7 @@ impl Default for Profile {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
 struct Settings {
     work_mode: String,   // Капча | Звонки | Авто ВК
     hashes: String,      // Ручной | Авто API | Авто ВК
@@ -153,6 +156,22 @@ struct Settings {
     masking: String,     // Простая | Средняя
     fingerprint: String, // Firefox | Safari | Chrome
     extra_threads: bool,
+    // расширенные опции ядра
+    turn: String,
+    custom_turn_ips: String,
+    turn_transport: String, // udp | tcp
+    srtp_mode: String,      // auto | wrap | dtls
+    captcha_mode: String,   // auto | rjs | wv
+    listen: String,         // пусто = LISTEN по умолчанию
+    validate_hashes: bool,
+    domain_routing: bool,
+    exclude_ru_zones: bool,
+    template_domains: bool,
+    domain_whitelist: bool,
+    direct_domains: String,
+    ip_routing: bool,
+    ip_whitelist: bool,
+    direct_ips: String,
 }
 
 impl Default for Settings {
@@ -164,6 +183,21 @@ impl Default for Settings {
             masking: "Простая".into(),
             fingerprint: "Firefox".into(),
             extra_threads: false,
+            turn: String::new(),
+            custom_turn_ips: String::new(),
+            turn_transport: "udp".into(),
+            srtp_mode: "auto".into(),
+            captcha_mode: "auto".into(),
+            listen: String::new(),
+            validate_hashes: false,
+            domain_routing: false,
+            exclude_ru_zones: false,
+            template_domains: false,
+            domain_whitelist: false,
+            direct_domains: String::new(),
+            ip_routing: false,
+            ip_whitelist: false,
+            direct_ips: String::new(),
         }
     }
 }
@@ -206,6 +240,7 @@ enum Page {
     Connect,
     Logs,
     Settings,
+    Info,
 }
 
 // ───────────────────────────── лог-канал ─────────────────────────────
@@ -266,25 +301,6 @@ fn delete_vk_token() {
     push_log("[ВК] Токен удалён".into());
 }
 
-/// Токен либо введён вручную, либо это URL редиректа blank.html#access_token=...
-fn extract_token(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some(pos) = raw.find("access_token=") {
-        let rest = &raw[pos + "access_token=".len()..];
-        let tok = rest
-            .split(['&', '#', ' '])
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        return (!tok.is_empty()).then_some(tok);
-    }
-    (!raw.contains('/')).then(|| raw.to_string())
-}
-
 fn open_browser(url: &str) {
     #[cfg(windows)]
     let _ = std::process::Command::new("cmd")
@@ -292,147 +308,6 @@ fn open_browser(url: &str) {
         .spawn();
     #[cfg(not(windows))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-}
-
-// ───────────────────── VK-логин: WebView2 (Windows) ─────────────────────
-
-#[cfg(windows)]
-fn vk_login_start() -> Receiver<Result<String, String>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(run_vk_webview());
-    });
-    rx
-}
-
-#[cfg(windows)]
-fn run_vk_webview() -> Result<String, String> {
-    use std::time::Instant;
-    use winit::application::ApplicationHandler;
-    use winit::dpi::LogicalSize;
-    use winit::event::WindowEvent;
-    use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-    use winit::window::{Window, WindowAttributes, WindowId};
-
-    #[derive(Debug)]
-    enum UserEv {
-        Token(String),
-    }
-
-    struct VkApp {
-        proxy: EventLoopProxy<UserEv>,
-        window: Option<Window>,
-        webview: Option<wry::WebView>,
-        result: Option<String>,
-        error: Option<String>,
-        started: Instant,
-    }
-
-    impl ApplicationHandler<UserEv> for VkApp {
-        fn resumed(&mut self, el: &ActiveEventLoop) {
-            if self.window.is_some() || self.error.is_some() {
-                return;
-            }
-            let attrs = WindowAttributes::default()
-                .with_title("Авторизация ВКонтакте")
-                .with_inner_size(LogicalSize::new(520.0, 720.0))
-                .with_min_inner_size(LogicalSize::new(380.0, 420.0));
-            let window = match el.create_window(attrs) {
-                Ok(w) => w,
-                Err(e) => {
-                    self.error = Some(format!("окно: {e}"));
-                    el.exit();
-                    return;
-                }
-            };
-            let proxy = self.proxy.clone();
-            let proxy2 = self.proxy.clone();
-            let init_js = r#"
-                setInterval(function () {
-                    try {
-                        var u = window.location.href || '';
-                        if (u.indexOf('blank.html') >= 0 && u.indexOf('access_token') >= 0) {
-                            window.ipc.postMessage('VKURL|' + u);
-                        }
-                    } catch (e) {}
-                }, 400);
-            "#;
-            let built = wry::WebViewBuilder::new()
-                .with_url(VK_AUTH_URL)
-                .with_initialization_script(init_js)
-                .with_navigation_handler(move |url: String| {
-                    if url.contains("blank.html")
-                        && let Some(tok) = extract_token(&url)
-                    {
-                        let _ = proxy.send_event(UserEv::Token(tok));
-                    }
-                    true
-                })
-                .with_ipc_handler(move |req: wry::http::Request<String>| {
-                    if let Some(rest) = req.body().strip_prefix("VKURL|")
-                        && let Some(tok) = extract_token(rest)
-                    {
-                        let _ = proxy2.send_event(UserEv::Token(tok));
-                    }
-                })
-                .build(&window);
-            match built {
-                Ok(w) => {
-                    self.webview = Some(w);
-                    self.window = Some(window);
-                }
-                Err(e) => {
-                    self.error =
-                        Some(format!("WebView недоступен ({e}); установи WebView2 Runtime"));
-                    el.exit();
-                }
-            }
-        }
-
-        fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-            if let WindowEvent::CloseRequested = event {
-                el.exit();
-            }
-        }
-
-        fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEv) {
-            match ev {
-                UserEv::Token(t) => self.result = Some(t),
-            }
-            el.exit();
-        }
-
-        fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-            if self.started.elapsed() > Duration::from_secs(300) {
-                el.exit();
-            }
-        }
-    }
-
-    let event_loop = EventLoop::<UserEv>::with_user_event()
-        .build()
-        .map_err(|e| format!("event loop: {e}"))?;
-    let mut app = VkApp {
-        proxy: event_loop.create_proxy(),
-        window: None,
-        webview: None,
-        result: None,
-        error: None,
-        started: Instant::now(),
-    };
-    let _ = event_loop.run_app(&mut app);
-    if let Some(e) = app.error {
-        return Err(e);
-    }
-    app.result
-        .ok_or_else(|| "окно закрыто до завершения входа".to_string())
-}
-
-#[cfg(not(windows))]
-fn vk_login_start() -> Receiver<Result<String, String>> {
-    let (tx, rx) = mpsc::channel();
-    let _ = tx.send(Err("на этой ОС открой страницу входа и вставь токен вручную".into()));
-    rx
 }
 
 // ───────────────────── VK API: авто-звонки (Авто API) ─────────────────────
@@ -825,12 +700,35 @@ fn icon_button(ui: &mut egui::Ui, kind: &str, size: f32) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Power-символ: дуга с разрывом сверху + штырёк (Material power icon).
+/// В egui 0.31 нет ArcShape, поэтому дуга — полилиния из 28 сегментов.
+fn power_glyph(p: &Painter, c: Pos2, r: f32, sw: Stroke) {
+    let gap = 0.62f32;
+    let a0 = -std::f32::consts::FRAC_PI_2 + gap;
+    let a1 = -std::f32::consts::FRAC_PI_2 - gap + std::f32::consts::TAU;
+    let n = 28;
+    let mut prev = c + Vec2::angled(a0) * r;
+    for i in 1..=n {
+        let a = a0 + (a1 - a0) * i as f32 / n as f32;
+        let pt = c + Vec2::angled(a) * r;
+        p.line_segment([prev, pt], sw);
+        prev = pt;
+    }
+    p.line_segment(
+        [c + Vec2::new(0.0, -(r + sw.width * 2.0)), c + Vec2::new(0.0, -r * 0.18)],
+        sw,
+    );
+}
+
 fn draw_nav_icon(p: &Painter, c: Pos2, icon: &str, col: Color32) {
     let sw = Stroke::new(1.9, col);
     match icon {
         "power" => {
-            p.circle_stroke(c + Vec2::new(0.0, 2.5), 6.5, sw);
-            p.line_segment([c + Vec2::new(0.0, -10.0), c + Vec2::new(0.0, -2.0)], sw);
+            power_glyph(p, c + Vec2::new(0.0, 2.0), 6.5, sw);
+        }
+        "info" => {
+            p.circle_filled(c + Vec2::new(0.0, -7.0), 1.7, col);
+            p.line_segment([c + Vec2::new(0.0, -2.5), c + Vec2::new(0.0, 8.0)], sw);
         }
         "term" => {
             p.line_segment([c + Vec2::new(-7.0, -5.0), c + Vec2::new(-2.0, 0.0)], sw);
@@ -850,10 +748,11 @@ fn draw_nav_icon(p: &Painter, c: Pos2, icon: &str, col: Color32) {
 
 /// ProxyNavigationBar: floating pill bar with primary indicator + icon/label per tab.
 fn nav_bar(ui: &mut egui::Ui, page: Page) -> Option<Page> {
-    let items: [(Page, &str, &str); 3] = [
+    let items: [(Page, &str, &str); 4] = [
         (Page::Connect, "Подключение", "power"),
         (Page::Logs, "Логи", "term"),
         (Page::Settings, "Настройки", "gear"),
+        (Page::Info, "Инфо", "info"),
     ];
     let avail = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, 66.0), Sense::hover());
@@ -971,7 +870,7 @@ struct App {
     session: Option<Session>,
     editor: Option<u64>,
     alert: Option<String>,
-    vk_pending: Option<Receiver<Result<String, String>>>,
+    adv_open: bool,
     picker_open: bool,
     paste_open: bool,
     paste_text: String,
@@ -1004,7 +903,7 @@ impl App {
             session: None,
             editor: None,
             alert: None,
-            vk_pending: None,
+            adv_open: false,
             picker_open: false,
             paste_open: false,
             paste_text: String::new(),
@@ -1104,33 +1003,6 @@ impl App {
                 UiEvent::Alert(msg) => self.alert = Some(msg),
             }
         }
-        let mut done: Option<Result<String, String>> = None;
-        if let Some(rx) = &self.vk_pending {
-            match rx.try_recv() {
-                Ok(res) => done = Some(res),
-                Err(TryRecvError::Disconnected) => {
-                    done = Some(Err("канал входа закрыт".into()))
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(res) = done {
-            self.vk_pending = None;
-            match res {
-                Ok(tok) => {
-                    if save_vk_token(&tok) {
-                        self.alert = Some("Авторизация ВКонтакте пройдена".into());
-                    } else {
-                        self.alert = Some("Не удалось сохранить токен ВК".into());
-                    }
-                    self.paste_open = false;
-                }
-                Err(e) => {
-                    push_log(format!("[ВК] Вход не завершён: {e}"));
-                    self.paste_open = true;
-                }
-            }
-        }
     }
 
     fn start(&mut self) {
@@ -1201,6 +1073,7 @@ impl App {
         let vk_token_for_core = token.clone();
         let auto_api = hash_mode == "auto_api";
         let hash_mode_owned = hash_mode.to_string();
+        let adv = s.clone();
 
         self.session = Some(Session {
             cancel: cancel.clone(),
@@ -1240,11 +1113,16 @@ impl App {
                 }
             }
 
+            let listen = if adv.listen.trim().is_empty() {
+                LISTEN.to_string()
+            } else {
+                adv.listen.trim().to_string()
+            };
             let config = csqtt_core::ClientConfig {
-                turn: String::new(),
-                custom_turn_ips: String::new(),
+                turn: adv.turn.trim().to_string(),
+                custom_turn_ips: adv.custom_turn_ips.trim().to_string(),
                 port: String::new(),
-                listen: LISTEN.to_string(),
+                listen,
                 vk: vk_value,
                 vk_hash_mode: hash_mode_owned,
                 peer,
@@ -1255,26 +1133,26 @@ impl App {
                 device_id,
                 password,
                 vk_auth_mode: auth_mode.to_string(),
-                captcha_mode: "auto".to_string(),
+                captcha_mode: adv.captcha_mode.clone(),
                 fingerprint,
                 client_ids: DEFAULT_CLIENT_IDS.to_string(),
                 obfs: obfs.to_string(),
-                turn_transport: "udp".to_string(),
-                srtp_mode: "auto".to_string(),
+                turn_transport: adv.turn_transport.clone(),
+                srtp_mode: adv.srtp_mode.clone(),
                 generation,
                 salt,
                 tun_uds: if cfg!(windows) { "wintun" } else { "tun" }.to_string(),
-                validate_vk_hashes: false,
+                validate_vk_hashes: adv.validate_hashes,
                 vk_js_token: vk_token_for_core,
-                domain_routing: false,
-                exclude_ru_zones: false,
-                template_domains: false,
-                domain_whitelist: false,
-                direct_domains: String::new(),
+                domain_routing: adv.domain_routing,
+                exclude_ru_zones: adv.exclude_ru_zones,
+                template_domains: adv.template_domains,
+                domain_whitelist: adv.domain_whitelist,
+                direct_domains: adv.direct_domains.trim().to_string(),
                 domains_file: Vec::new(),
-                ip_routing: false,
-                ip_whitelist: false,
-                direct_ips: String::new(),
+                ip_routing: adv.ip_routing,
+                ip_whitelist: adv.ip_whitelist,
+                direct_ips: adv.direct_ips.trim().to_string(),
             };
 
             let result = csqtt_core::run_client(config, Some(cancel)).await;
@@ -1316,11 +1194,6 @@ impl App {
                 ui.label(RichText::new("CSQTT").strong().color(ON_BG).size(21.0));
                 ui.label(RichText::new("v2.5.0 · desktop").color(ON_SURF_VAR).size(11.0));
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, "gear", 40.0).clicked() {
-                    self.page = Page::Settings;
-                }
-            });
         });
 
         let active = !matches!(self.state, ConnState::Disconnected);
@@ -1333,7 +1206,7 @@ impl App {
 
         // центральная карточка подключения
         let mut toggle = false;
-        cs_card(Margin::symmetric(20, 22)).show(ui, |ui| {
+        cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| {
                 let (c_rect, resp) = ui.allocate_exact_size(Vec2::splat(176.0), Sense::click());
@@ -1353,11 +1226,7 @@ impl App {
                 let gc = c + Vec2::new(0.0, 4.0);
                 let gr = r * 0.32;
                 let gcol = if active { ON_PRIMARY } else { ON_SURF_VAR.linear_multiply(0.55) };
-                p.circle_stroke(gc, gr, Stroke::new(3.0, gcol));
-                p.line_segment(
-                    [gc + Vec2::new(0.0, -gr - 5.0), gc + Vec2::new(0.0, -gr + 11.0)],
-                    Stroke::new(3.0, gcol),
-                );
+                power_glyph(p, gc, gr, Stroke::new(3.0, gcol));
                 if resp.clicked() {
                     toggle = true;
                 }
@@ -1453,21 +1322,16 @@ impl App {
                 &resp,
                 egui::PopupCloseBehavior::CloseOnClick,
                 |ui| {
-                    cs_card(Margin::symmetric(6, 6)).show(ui, |ui| {
-                        ui.set_min_width(220.0);
-                        for p in &self.store.profiles {
-                            let on = Some(p.id) == self.store.active_profile_id;
-                            if ui
-                                .selectable_label(
-                                    on,
-                                    RichText::new(&p.name).color(ON_SURF).size(13.0),
-                                )
-                                .clicked()
-                            {
-                                selected = Some(p.id);
-                            }
+                    ui.set_min_width(220.0);
+                    for p in &self.store.profiles {
+                        let on = Some(p.id) == self.store.active_profile_id;
+                        if ui
+                            .selectable_label(on, RichText::new(&p.name).color(ON_SURF).size(13.0))
+                            .clicked()
+                        {
+                            selected = Some(p.id);
                         }
-                    });
+                    }
                 },
             );
 
@@ -1601,7 +1465,7 @@ impl App {
         let mut changed = false;
 
         // карточка: аккаунт ВК
-        cs_card(Margin::symmetric(16, 14)).show(ui, |ui| {
+        cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut login = false;
             setting_row(
@@ -1616,17 +1480,13 @@ impl App {
                         {
                             delete_vk_token();
                         }
-                    } else if self.vk_pending.is_some() {
-                        ui.label(RichText::new("ждём вход...").color(ON_SURF_VAR).size(12.0));
                     } else if pill_button(ui, "Логин", Vec2::new(96.0, 36.0)).clicked() {
                         login = true;
                     }
                 },
             );
             if login {
-                #[cfg(not(windows))]
                 open_browser(VK_AUTH_URL);
-                self.vk_pending = Some(vk_login_start());
                 self.paste_open = true;
             }
             let (dot, txt) = if has_token {
@@ -1663,7 +1523,7 @@ impl App {
         ui.add_space(12.0);
 
         // карточка: туннель
-        cs_card(Margin::symmetric(16, 14)).show(ui, |ui| {
+        cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             setting_label(ui, "Режим работы");
             let cur = s.work_mode.clone();
@@ -1756,6 +1616,158 @@ impl App {
                 });
             });
         });
+        ui.add_space(12.0);
+
+        // карточка: расширенные опции ядра
+        cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let head = ui.add_sized(
+                Vec2::new(ui.available_width(), 30.0),
+                egui::Button::new(
+                    RichText::new(if self.adv_open { "▾  Расширенные" } else { "▸  Расширенные" })
+                        .strong()
+                        .color(ON_SURF)
+                        .size(14.5),
+                )
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(12.0),
+            );
+            if head.clicked() {
+                self.adv_open = !self.adv_open;
+            }
+            if self.adv_open {
+                separator(ui);
+                setting_label(ui, "TURN");
+                let old = s.turn.clone();
+                ui.horizontal_wrapped(|ui| {
+                    pill_field(ui, &mut s.turn, "TURN host[:port] · пусто = авто-подбор", 380.0);
+                });
+                changed |= s.turn != old;
+                ui.add_space(6.0);
+                setting_label(ui, "Свои TURN IP");
+                let old = s.custom_turn_ips.clone();
+                ui.horizontal_wrapped(|ui| {
+                    pill_field(ui, &mut s.custom_turn_ips, "IP через запятую — только они", 380.0);
+                });
+                changed |= s.custom_turn_ips != old;
+                ui.add_space(6.0);
+                setting_label(ui, "Транспорт TURN");
+                let cur = s.turn_transport.clone();
+                segmented(ui, "turntr", &cur, &["udp", "tcp"], &mut |v: &str| {
+                    changed = true;
+                    s.turn_transport = v.to_string();
+                });
+                separator(ui);
+
+                setting_label(ui, "SRTP");
+                let cur = s.srtp_mode.clone();
+                segmented(ui, "srtp", &cur, &["auto", "wrap", "dtls"], &mut |v: &str| {
+                    changed = true;
+                    s.srtp_mode = v.to_string();
+                });
+                ui.add_space(6.0);
+                setting_label(ui, "Капча");
+                let cur = s.captcha_mode.clone();
+                segmented(ui, "cap", &cur, &["auto", "rjs", "wv"], &mut |v: &str| {
+                    changed = true;
+                    s.captcha_mode = v.to_string();
+                });
+                ui.add_space(6.0);
+                setting_label(ui, "Локальный адрес (listen)");
+                let old = s.listen.clone();
+                ui.horizontal_wrapped(|ui| {
+                    pill_field(ui, &mut s.listen, "127.0.0.1:9000", 380.0);
+                });
+                changed |= s.listen != old;
+                ui.add_space(6.0);
+                setting_row(
+                    ui,
+                    "Проверять хеши ВК",
+                    Some("отсеивать мёртвые хеши до запуска туннелей"),
+                    |ui| {
+                        let on = s.validate_hashes;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.validate_hashes = v;
+                        });
+                    },
+                );
+                separator(ui);
+
+                setting_row(
+                    ui,
+                    "Маршрутизация по доменам",
+                    Some("часть трафика идёт напрямую, минуя туннель"),
+                    |ui| {
+                        let on = s.domain_routing;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.domain_routing = v;
+                        });
+                    },
+                );
+                if s.domain_routing {
+                    ui.add_space(4.0);
+                    setting_row(ui, "Исключить RU-зоны", None, |ui| {
+                        let on = s.exclude_ru_zones;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.exclude_ru_zones = v;
+                        });
+                    });
+                    setting_row(ui, "Шаблонные домены", None, |ui| {
+                        let on = s.template_domains;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.template_domains = v;
+                        });
+                    });
+                    setting_row(ui, "Только белый список", None, |ui| {
+                        let on = s.domain_whitelist;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.domain_whitelist = v;
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let old = s.direct_domains.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        pill_field(ui, &mut s.direct_domains, "домены через запятую", 380.0);
+                    });
+                    changed |= s.direct_domains != old;
+                }
+                separator(ui);
+
+                setting_row(
+                    ui,
+                    "Маршрутизация по IP",
+                    Some("часть подсетей идёт напрямую, минуя туннель"),
+                    |ui| {
+                        let on = s.ip_routing;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.ip_routing = v;
+                        });
+                    },
+                );
+                if s.ip_routing {
+                    ui.add_space(4.0);
+                    setting_row(ui, "Только белый список", None, |ui| {
+                        let on = s.ip_whitelist;
+                        switch_pill(ui, on, &mut |v| {
+                            changed = true;
+                            s.ip_whitelist = v;
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let old = s.direct_ips.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        pill_field(ui, &mut s.direct_ips, "CIDR через запятую", 380.0);
+                    });
+                    changed |= s.direct_ips != old;
+                }
+            }
+        });
         ui.add_space(10.0);
         ui.label(
             RichText::new("настройки применяются автоматически, кнопка «Сохранить» не нужна")
@@ -1768,6 +1780,57 @@ impl App {
             self.store.settings = Some(s);
             self.store.save();
         }
+    }
+
+    // ─────────────────────────── экран: Инфо ───────────────────────────
+
+    fn ui_info(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Инфо").strong().color(ON_BG).size(19.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, "close", 36.0).clicked() {
+                    self.page = Page::Connect;
+                }
+            });
+        });
+        ui.add_space(12.0);
+
+        cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("csqtt-desktop · v1.1 (ядро csqtt 2.5.0)")
+                    .strong()
+                    .color(ON_SURF)
+                    .size(14.5),
+            );
+            ui.add_space(8.0);
+            for line in [
+                "Неофициальный десктопный клиент csqtt: собственное GUI на Rust \
+                 (eframe/egui), интерфейс в стиле основного клиента.",
+                "Ядро обновлено до csqtt v2.5.0. Бренд и ассеты оригинального \
+                 проекта не используются.",
+                "Профили, настройки и VK-токен хранятся только на этом компьютере.",
+            ] {
+                ui.label(RichText::new(line).color(ON_SURF_VAR).size(12.5));
+                ui.add_space(6.0);
+            }
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if pill_button(ui, "Репозиторий GitHub", Vec2::new(196.0, 42.0)).clicked() {
+                    open_browser("https://github.com/ProFFs/csqtt-desktop");
+                }
+                if pill_button_outlined(
+                    ui,
+                    "Скачать новую версию",
+                    Vec2::new(196.0, 42.0),
+                    ON_SURF_VAR,
+                )
+                .clicked()
+                {
+                    open_browser("https://github.com/ProFFs/csqtt-desktop/releases/latest");
+                }
+            });
+        });
     }
 
     // ─────────────────────────── оверлеи ───────────────────────────
@@ -1883,6 +1946,8 @@ impl eframe::App for App {
         visuals.panel_fill = BG;
         visuals.window_fill = CARD;
         visuals.extreme_bg_color = SURFACE;
+        visuals.window_stroke = Stroke::new(1.0, CARD_BORDER);
+        visuals.menu_corner_radius = CornerRadius::same(18);
         visuals.faint_bg_color = SURF_VAR;
         visuals.widgets.noninteractive.fg_stroke.color = ON_BG;
         visuals.widgets.inactive.bg_fill = SURF_VAR;
@@ -1925,6 +1990,11 @@ impl eframe::App for App {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| self.ui_settings(ui));
+                }
+                Page::Info => {
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.ui_info(ui));
                 }
             });
 
@@ -1978,7 +2048,7 @@ fn main() -> eframe::Result {
 #[cfg(windows)]
 fn force_dpi_awareness() {
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn SetProcessDpiAwarenessContext(value: isize) -> i32;
     }
     const DPI_AWARE_PER_MONITOR_V2: isize = -4;
@@ -1993,7 +2063,7 @@ fn force_dpi_awareness() {}
 #[cfg(windows)]
 fn os_scale_factor() -> f32 {
     #[link(name = "user32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetDpiForSystem() -> u32;
     }
     let dpi = unsafe { GetDpiForSystem() };

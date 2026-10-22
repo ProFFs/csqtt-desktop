@@ -14,8 +14,3 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = "0.7.19"
-
-# VK-логин через системный WebView2 (только Windows); на Linux — ручной ввод токена.
-[target.'cfg(windows)'.dependencies]
-winit = "0.30"
-wry = "0.57"
