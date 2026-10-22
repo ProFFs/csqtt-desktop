@@ -297,7 +297,7 @@ fn run_vk_webview() -> Result<String, String> {
     use winit::application::ApplicationHandler;
     use winit::dpi::LogicalSize;
     use winit::event::WindowEvent;
-    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
     use winit::window::{Window, WindowAttributes, WindowId};
 
     #[derive(Debug)]
@@ -306,6 +306,7 @@ fn run_vk_webview() -> Result<String, String> {
     }
 
     struct VkApp {
+        proxy: EventLoopProxy<UserEv>,
         window: Option<Window>,
         webview: Option<wry::WebView>,
         result: Option<String>,
@@ -330,8 +331,8 @@ fn run_vk_webview() -> Result<String, String> {
                     return;
                 }
             };
-            let proxy = el.create_proxy();
-            let proxy2 = el.create_proxy();
+            let proxy = self.proxy.clone();
+            let proxy2 = self.proxy.clone();
             let init_js = r#"
                 setInterval(function () {
                     try {
@@ -398,6 +399,7 @@ fn run_vk_webview() -> Result<String, String> {
         .build()
         .map_err(|e| format!("event loop: {e}"))?;
     let mut app = VkApp {
+        proxy: event_loop.create_proxy(),
         window: None,
         webview: None,
         result: None,
