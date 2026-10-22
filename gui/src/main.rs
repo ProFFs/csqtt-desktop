@@ -1310,8 +1310,6 @@ impl App {
     // ─────────────────────────── экран: Подключение ───────────────────────────
 
     fn ui_connect(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
-
         // header: wordmark + actions (CsqttScreen)
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
@@ -1408,15 +1406,9 @@ impl App {
             }
         }
 
-        // нижняя строка: выбор профиля
-        let bar = Rect::from_min_size(
-            Pos2::new(rect.left(), rect.bottom() - 52.0),
-            Vec2::new(rect.width(), 52.0),
-        );
-        ui.put(bar, |ui: &mut egui::Ui| {
-            self.profile_bar(ui);
-            ui.response()
-        });
+        // строка выбора профиля
+        ui.add_space(14.0);
+        self.profile_bar(ui);
     }
 
     fn profile_bar(&mut self, ui: &mut egui::Ui) {
@@ -1482,29 +1474,16 @@ impl App {
             if pill_button_outlined(ui, "Изменить", Vec2::new(96.0, 44.0), ON_SURF_VAR).clicked() {
                 edit_active = true;
             }
+            let pr = ui.add_sized(
+                Vec2::splat(44.0),
+                egui::Button::new(RichText::new("+").strong().color(ON_PRIMARY).size(20.0))
+                    .fill(PRIMARY)
+                    .corner_radius(22.0),
+            );
+            if pr.clicked() {
+                add_new = true;
+            }
         });
-        if ui
-            .interact(
-                Rect::from_min_size(ui.max_rect().right_top() + Vec2::new(-44.0, 0.0), Vec2::new(44.0, 44.0)),
-                ui.id().with("profile-add"),
-                Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            add_new = true;
-        }
-        let plus_c = ui.max_rect().right_top() + Vec2::new(-22.0, 22.0);
-        let p = ui.painter();
-        p.circle_filled(plus_c, 18.0, PRIMARY);
-        p.line_segment(
-            [plus_c + Vec2::new(-7.0, 0.0), plus_c + Vec2::new(7.0, 0.0)],
-            Stroke::new(2.2, ON_PRIMARY),
-        );
-        p.line_segment(
-            [plus_c + Vec2::new(0.0, -7.0), plus_c + Vec2::new(0.0, 7.0)],
-            Stroke::new(2.2, ON_PRIMARY),
-        );
 
         if let Some(id) = selected {
             self.store.active_profile_id = Some(id);
@@ -1530,7 +1509,6 @@ impl App {
     // ─────────────────────────── экран: Логи ───────────────────────────
 
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Логи").strong().color(ON_BG).size(19.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1551,8 +1529,7 @@ impl App {
         });
         ui.add_space(10.0);
 
-        let cap_h = 60.0f32;
-        let term_h = (rect.height() - 36.0 - 10.0 - cap_h).max(120.0);
+        let term_h = (ui.available_height() - 110.0).max(140.0);
         Frame::new()
             .fill(TERM_BG)
             .corner_radius(CornerRadius::same(24))
@@ -1592,7 +1569,7 @@ impl App {
                 ui,
                 &mut ans,
                 "Ответ капчи: success_token / error:...",
-                (rect.width() - 130.0).max(200.0),
+                (ui.available_width() - 130.0).max(200.0),
             );
             let send = pill_button(ui, "Отправить", Vec2::new(112.0, 40.0)).clicked();
             self.captcha_answer = ans;
@@ -1924,37 +1901,31 @@ impl eframe::App for App {
         }
 
         let mut goto = None;
+        egui::TopBottomPanel::bottom("nav")
+            .frame(
+                Frame::new()
+                    .fill(BG)
+                    .inner_margin(Margin { left: 20, right: 20, top: 6, bottom: 14 }),
+            )
+            .show(ctx, |ui| {
+                if let Some(p) = nav_bar(ui, self.page) {
+                    goto = Some(p);
+                }
+            });
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
                     .fill(BG)
                     .inner_margin(Margin { left: 20, right: 20, top: 12, bottom: 12 }),
             )
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    let nav_h = 78.0f32;
-                    let avail = ui.available_height();
-                    let (area, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), (avail - nav_h).max(120.0)),
-                        Sense::hover(),
-                    );
-                    ui.put(area, |ui: &mut egui::Ui| {
-                        match self.page {
-                            Page::Connect => self.ui_connect(ui),
-                            Page::Logs => self.ui_logs(ui),
-                            Page::Settings => {
-                                ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| self.ui_settings(ui));
-                            }
-                        }
-                        ui.response()
-                    });
-                    ui.add_space(12.0);
-                    if let Some(p) = nav_bar(ui, self.page) {
-                        goto = Some(p);
-                    }
-                });
+            .show(ctx, |ui| match self.page {
+                Page::Connect => self.ui_connect(ui),
+                Page::Logs => self.ui_logs(ui),
+                Page::Settings => {
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.ui_settings(ui));
+                }
             });
 
         if let Some(p) = goto {
