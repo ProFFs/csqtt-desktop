@@ -1,6 +1,6 @@
 // csqtt-desktop — десктопный клиент csqtt.
 //
-// Интерфейс: тёмная тема csqtt (Material3 warm-brown), нижняя навигация-пилюля,
+// Интерфейс: сине-серая тема (светлая/тёмная по системе), нижняя навигация-пилюля,
 // экраны Подключение / Логи / Настройки; профили, VK-токен, авто-режимы хешей.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -18,40 +18,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
-// ───────────────────────────── палитра csqtt (тёмная тема) ─────────────────────────────
-// Material3 darkColorScheme + CsqttExtendedColors из Theme.kt оригинального клиента csqtt.
+// ───────────────────────────── палитра ─────────────────────────────
+// Сине-серая тема (светлая/тёмная по системе) живёт в theme.rs; доступ: th().ИМЯ.
 
-const BG: Color32 = Color32::from_rgb(0x1A, 0x16, 0x14);
-const SURFACE: Color32 = Color32::from_rgb(0x21, 0x1D, 0x1B);
-const SURF_VAR: Color32 = Color32::from_rgb(0x2C, 0x26, 0x24);
-const ON_BG: Color32 = Color32::from_rgb(0xED, 0xE0, 0xD4);
-const ON_SURF: Color32 = Color32::from_rgb(0xED, 0xE0, 0xD4);
-const ON_SURF_VAR: Color32 = Color32::from_rgb(0xD7, 0xCC, 0xC8);
-const PRIMARY: Color32 = Color32::from_rgb(0xD7, 0xCC, 0xC8);
-const ON_PRIMARY: Color32 = Color32::from_rgb(0x3E, 0x27, 0x23);
-const PRIMARY_CONT: Color32 = Color32::from_rgb(0x5D, 0x40, 0x37);
-const SECONDARY: Color32 = Color32::from_rgb(0xBC, 0xAA, 0xA4);
-const TERTIARY: Color32 = Color32::from_rgb(0xA1, 0x88, 0x7F);
-const OUTLINE: Color32 = Color32::from_rgb(0x8D, 0x6E, 0x63);
-const OUTLINE_VAR: Color32 = Color32::from_rgb(0x4E, 0x34, 0x2E);
-const ERR: Color32 = Color32::from_rgb(0xFF, 0xB4, 0xAB);
-const ERR_CONT: Color32 = Color32::from_rgb(0x93, 0x00, 0x0A);
-const ON_ERR_CONT: Color32 = Color32::from_rgb(0xFF, 0xDA, 0xD6);
-// AppSectionCard: lerp(background, surface, 0.82) + outlineVariant @ 32%
-const CARD: Color32 = Color32::from_rgb(0x1F, 0x1B, 0x19);
-const CARD_BORDER: Color32 = Color32::from_rgba_premultiplied(0x4E, 0x34, 0x2E, 82);
-const NAV_BORDER: Color32 = Color32::from_rgba_premultiplied(0x4E, 0x34, 0x2E, 107);
-// extended (dark)
-const SUCCESS: Color32 = Color32::from_rgb(0x9B, 0xD4, 0xAF);
-const WARNING: Color32 = Color32::from_rgb(0xF2, 0xC2, 0x5B);
-const INFO: Color32 = Color32::from_rgb(0xB2, 0xC5, 0xFF);
-const WARN_CONT: Color32 = Color32::from_rgb(0x5C, 0x42, 0x00);
-const ON_WARN_CONT: Color32 = Color32::from_rgb(0xFF, 0xDE, 0xA2);
-const TERM_BG: Color32 = Color32::from_rgb(0x10, 0x12, 0x16);
-const TERM_TEXT: Color32 = Color32::from_rgb(0xDD, 0xE1, 0xE8);
-const TERM_MUTED: Color32 = Color32::from_rgb(0x9D, 0xA3, 0xAE);
-const TERM_OK: Color32 = Color32::from_rgb(0x9B, 0xD4, 0xAF);
-const TERM_ERR: Color32 = Color32::from_rgb(0xFF, 0xB4, 0xAB);
+mod theme;
+mod vk_login;
+
+use theme::th;
 const EVENT_PREFIX: &str = "__CSQTT_EVENT__|";
 const VK_AUTH_URL: &str = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727\
     &redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=page&response_type=token\
@@ -63,6 +36,12 @@ const WORKERS_PER_GROUP: usize = 9;
 const MAX_VK_HASHES: usize = 6;
 // Единый внутренний отступ секционных карточек (AppSectionCard padding).
 const SP: i8 = 16;
+// Полные описания непонятных сокращений (подсказка по кнопке ⓘ).
+const DOC_SRTP: &str = "SRTP — шифрование медиапотока в туннеле.\nAUTO — ядро само выбирает режим.\nWRAP — ключи передаются через VK-обёртку: надёжнее и совместимо со всеми серверами.\nDTLS — классический DTLS 1.2 (ECDSA P-256): быстрее, но некоторые прокси его режут.";
+const DOC_CAPTCHA: &str = "Как клиент решает капчу VK при установке туннелей.\nСистемный выбор — ядро перебирает решатели само: собственный Rust-решатель, затем фолбэки, при необходимости попросит решить вручную.\nRJS — только собственный Rust/JS-решатель.\nWV — решение через WebView: на десктопе недоступно, выбери систему или RJS.";
+const DOC_TURN: &str = "TURN — резервный relay-сервер: если прямое соединение с пирами не проходит, трафик идёт через TURN. Пусто = ядро подберёт серверы само.";
+const DOC_TURN_TRANSPORT: &str = "Транспорт до TURN-сервера.\nUDP — быстрее и меньше задержка, но некоторые провайдеры режут TURN по UDP.\nTCP — стабильнее через DPI и файрволы, ценой небольшой задержки.";
+const DOC_LISTEN: &str = "LISTEN — локальный адрес (host:port), на котором клиент поднимает прокси-сервер: к нему подключаются приложения, чей трафик идёт в туннель.";
 
 // ───────────────────────────── утилиты ─────────────────────────────
 
@@ -235,7 +214,7 @@ enum UiEvent {
     Alert(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     Connect,
     Logs,
@@ -486,26 +465,28 @@ fn format_uptime(total: u64) -> String {
 /// AppSectionCard: Surface(Card shape, color lerp(bg,surface,.82), border outlineVariant@32%)
 fn cs_card(inner: Margin) -> Frame {
     Frame::new()
-        .fill(CARD)
+        .fill(th().CARD)
         .corner_radius(CornerRadius::same(26))
         .inner_margin(inner)
-        .stroke(Stroke::new(1.0, CARD_BORDER))
+        .stroke(Stroke::new(1.0, th().CARD_BORDER))
 }
 
 fn cs_dialog(inner: Margin) -> Frame {
     Frame::new()
-        .fill(CARD)
+        .fill(th().CARD)
         .corner_radius(CornerRadius::same(26))
         .inner_margin(inner)
-        .stroke(Stroke::new(1.0, CARD_BORDER))
+        .stroke(Stroke::new(1.0, th().CARD_BORDER))
 }
 
 /// CsqttSegmentedControl: pill row; selected = primary fill + check + onPrimary text.
+/// options: (значение, отображаемая подпись). Сверху — невидимые настоящие кнопки:
+/// доступность (AccessKit/kittest) и hover-курсор.
 fn segmented(
     ui: &mut egui::Ui,
-    id: &str,
+    _id: &str,
     value: &str,
-    options: &[&'static str],
+    options: &[(&str, &str)],
     on_change: &mut dyn FnMut(&str),
 ) {
     let n = options.len().max(1) as f32;
@@ -514,14 +495,18 @@ fn segmented(
     let avail = ui.available_width();
     let w = ((avail - gap * (n - 1.0)) / n).max(40.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, h), Sense::hover());
-    let painter = ui.painter();
-    for (i, opt) in options.iter().enumerate() {
-        let r = Rect::from_min_size(rect.min + Vec2::new(i as f32 * (w + gap), 0.0), Vec2::new(w, h));
+    {
+        let painter = ui.painter();
+    for (i, (opt, label)) in options.iter().enumerate() {
+        let r = Rect::from_min_size(
+            rect.min + Vec2::new(i as f32 * (w + gap), 0.0),
+            Vec2::new(w, h),
+        );
         let sel = *opt == value;
-        let fill = if sel { PRIMARY } else { SURF_VAR };
-        let fg = if sel { ON_PRIMARY } else { ON_SURF_VAR };
+        let fill = if sel { th().PRIMARY } else { th().SURF_VAR };
+        let fg = if sel { th().ON_PRIMARY } else { th().ON_SURF_VAR };
         painter.rect_filled(r, CornerRadius::same((h / 2.0) as u8), fill);
-        let galley = painter.layout_no_wrap(opt.to_string(), FontId::proportional(13.0), fg);
+        let galley = painter.layout_no_wrap(label.to_string(), FontId::proportional(13.0), fg);
         let check_w = if sel { 16.0 } else { 0.0 };
         let total_w = galley.size().x + check_w;
         let x0 = r.center().x - total_w / 2.0;
@@ -542,46 +527,71 @@ fn segmented(
             galley,
             Color32::TRANSPARENT,
         );
-        if ui.interact(r, ui.id().with(("seg", id, i)), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
+    }
+    }
+    for (i, (opt, label)) in options.iter().enumerate() {
+        let r = Rect::from_min_size(
+            rect.min + Vec2::new(i as f32 * (w + gap), 0.0),
+            Vec2::new(w, h),
+        );
+        let btn = egui::Button::new(RichText::new(*label).color(Color32::TRANSPARENT).size(13.0))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same((h / 2.0) as u8));
+        if ui.put(r, btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             on_change(opt);
         }
     }
 }
 
+/// Помощник: варианты без отдельной подписи (значение = подпись).
+fn seg_opts(vals: &[&'static str]) -> Vec<(&'static str, &'static str)> {
+    vals.iter().map(|v| (*v, *v)).collect()
+}
+
 /// Material3-style switch (track 52x32, thumb + check).
-fn switch_pill(ui: &mut egui::Ui, on: bool, on_toggle: &mut dyn FnMut(bool)) {
-    let (_s, rect) = ui.allocate_space(Vec2::new(52.0, 32.0));
-    let resp = ui.interact(rect, ui.id().with("switch"), Sense::click());
+/// label — доступное имя (скринридеры/kittest).
+fn switch_pill(ui: &mut egui::Ui, on: bool, label: &str, on_toggle: &mut dyn FnMut(bool)) {
+    let resp = ui
+        .add_sized(
+            Vec2::new(52.0, 32.0),
+            egui::Button::new(
+                RichText::new(format!("{label}: {}", if on { "включено" } else { "выключено" }))
+                    .color(Color32::TRANSPARENT)
+                    .size(1.0),
+            )
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(16.0),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.clicked() {
         on_toggle(!on);
     }
     let p = ui.painter();
-    let track = rect.shrink(4.0);
+    let track = resp.rect.shrink(4.0);
     let cy = track.center().y;
     if on {
-        p.rect_filled(track, CornerRadius::same(12), PRIMARY);
+        p.rect_filled(track, CornerRadius::same(12), th().PRIMARY);
         let cx = track.right() - 12.0;
-        p.circle_filled(Pos2::new(cx, cy), 9.0, ON_PRIMARY);
+        p.circle_filled(Pos2::new(cx, cy), 9.0, th().ON_PRIMARY);
         p.line_segment(
             [Pos2::new(cx - 4.0, cy), Pos2::new(cx - 1.0, cy + 3.0)],
-            Stroke::new(1.6, PRIMARY),
+            Stroke::new(1.6, th().PRIMARY),
         );
         p.line_segment(
             [Pos2::new(cx - 1.0, cy + 3.0), Pos2::new(cx + 4.0, cy - 3.0)],
-            Stroke::new(1.6, PRIMARY),
+            Stroke::new(1.6, th().PRIMARY),
         );
     } else {
-        p.rect_filled(track, CornerRadius::same(12), SURF_VAR);
+        p.rect_filled(track, CornerRadius::same(12), th().SURF_VAR);
         p.rect_stroke(
             track,
             CornerRadius::same(12),
-            Stroke::new(1.0, OUTLINE),
+            Stroke::new(1.0, th().OUTLINE),
             StrokeKind::Inside,
         );
-        p.circle_filled(Pos2::new(track.left() + 8.0, cy), 6.0, OUTLINE);
+        p.circle_filled(Pos2::new(track.left() + 8.0, cy), 6.0, th().OUTLINE);
     }
 }
 
@@ -592,12 +602,12 @@ fn pill_field(ui: &mut egui::Ui, value: &mut String, hint: &str, width: f32) {
         .fill(Color32::TRANSPARENT)
         .corner_radius(CornerRadius::same(20))
         .inner_margin(Margin::symmetric(14, 10))
-        .stroke(Stroke::new(1.2, OUTLINE.linear_multiply(0.45)))
+        .stroke(Stroke::new(1.2, th().OUTLINE.linear_multiply(0.45)))
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::singleline(value)
-                    .hint_text(RichText::new(hint).color(ON_SURF_VAR.linear_multiply(0.6)))
-                    .text_color(ON_SURF)
+                    .hint_text(RichText::new(hint).color(th().ON_SURF_VAR.linear_multiply(0.6)))
+                    .text_color(th().ON_SURF)
                     .desired_width(w - 30.0)
                     .frame(false)
                     .vertical_align(Align::Center),
@@ -621,7 +631,30 @@ fn banner(ui: &mut egui::Ui, text: &str, cont: Color32, fg: Color32) -> egui::Re
 }
 
 fn setting_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).strong().color(ON_SURF_VAR).size(12.0));
+    ui.label(RichText::new(text).strong().color(th().ON_SURF_VAR).size(12.0));
+    ui.add_space(6.0);
+}
+
+/// ⓘ — кнопка с полным описанием сокращения (всплывающая подсказка).
+fn info_dot(ui: &mut egui::Ui, text: &str) {
+    let r = ui
+        .add_sized(
+            Vec2::splat(18.0),
+            egui::Button::new(RichText::new("i").italics().color(th().ON_SURF_VAR).size(11.0))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(1.0, th().OUTLINE_VAR))
+                .corner_radius(9.0),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    r.on_hover_text(RichText::new(text).size(12.0).color(th().ON_SURF));
+}
+
+/// setting_label + ⓘ рядом.
+fn setting_label_i(ui: &mut egui::Ui, text: &str, doc: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(text).strong().color(th().ON_SURF_VAR).size(12.0));
+        info_dot(ui, doc);
+    });
     ui.add_space(6.0);
 }
 
@@ -630,7 +663,7 @@ fn separator(ui: &mut egui::Ui) {
     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
     ui.painter().line_segment(
         [r.left_center(), r.right_center()],
-        Stroke::new(1.0, OUTLINE_VAR.linear_multiply(0.5)),
+        Stroke::new(1.0, th().OUTLINE_VAR.linear_multiply(0.5)),
     );
     ui.add_space(12.0);
 }
@@ -639,9 +672,9 @@ fn separator(ui: &mut egui::Ui) {
 fn setting_row(ui: &mut egui::Ui, title: &str, desc: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new(title).strong().color(ON_SURF).size(14.5));
+            ui.label(RichText::new(title).strong().color(th().ON_SURF).size(14.5));
             if let Some(d) = desc {
-                ui.label(RichText::new(d).color(ON_SURF_VAR).size(11.5));
+                ui.label(RichText::new(d).color(th().ON_SURF_VAR).size(11.5));
             }
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -654,8 +687,8 @@ fn setting_row(ui: &mut egui::Ui, title: &str, desc: Option<&str>, content: impl
 fn pill_button(ui: &mut egui::Ui, label: &str, size: Vec2) -> egui::Response {
     ui.add_sized(
         size,
-        egui::Button::new(RichText::new(label).strong().color(ON_PRIMARY).size(13.0))
-            .fill(PRIMARY)
+        egui::Button::new(RichText::new(label).strong().color(th().ON_PRIMARY).size(13.0))
+            .fill(th().PRIMARY)
             .corner_radius(size.y / 2.0),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -667,7 +700,7 @@ fn pill_button_outlined(ui: &mut egui::Ui, label: &str, size: Vec2, fg: Color32)
         size,
         egui::Button::new(RichText::new(label).color(fg).size(13.0))
             .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, OUTLINE_VAR))
+            .stroke(Stroke::new(1.0, th().OUTLINE_VAR))
             .corner_radius(size.y / 2.0),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -681,7 +714,7 @@ fn icon_button(ui: &mut egui::Ui, kind: &str, size: f32) -> egui::Response {
     );
     let c = resp.rect.center();
     let p = ui.painter();
-    let col = ON_SURF_VAR;
+    let col = th().ON_SURF_VAR;
     let sw = Stroke::new(1.8, col);
     match kind {
         "close" => {
@@ -757,11 +790,11 @@ fn nav_bar(ui: &mut egui::Ui, page: Page) -> Option<Page> {
     let avail = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, 66.0), Sense::hover());
     let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(26), CARD);
+    p.rect_filled(rect, CornerRadius::same(26), th().CARD);
     p.rect_stroke(
         rect,
         CornerRadius::same(26),
-        Stroke::new(1.0, NAV_BORDER),
+        Stroke::new(1.0, th().NAV_BORDER),
         StrokeKind::Inside,
     );
     let pad = 6.0f32;
@@ -771,12 +804,11 @@ fn nav_bar(ui: &mut egui::Ui, page: Page) -> Option<Page> {
         rect.min + Vec2::new(pad + iw * sel as f32, 7.0),
         Vec2::new(iw, 52.0),
     );
-    p.rect_filled(ind.shrink(1.0), CornerRadius::same(20), PRIMARY);
-    let mut goto = None;
-    for (i, (pg, label, icon)) in items.iter().enumerate() {
+    p.rect_filled(ind.shrink(1.0), CornerRadius::same(20), th().PRIMARY);
+    for (i, (_pg, label, icon)) in items.iter().enumerate() {
         let r = Rect::from_min_size(rect.min + Vec2::new(pad + iw * i as f32, 7.0), Vec2::new(iw, 52.0));
         let on = i == sel;
-        let col = if on { ON_PRIMARY } else { ON_SURF_VAR.linear_multiply(0.55) };
+        let col = if on { th().ON_PRIMARY } else { th().ON_SURF_VAR.linear_multiply(0.55) };
         let c = r.center();
         draw_nav_icon(p, c + Vec2::new(0.0, -8.0), icon, col);
         p.text(
@@ -786,10 +818,15 @@ fn nav_bar(ui: &mut egui::Ui, page: Page) -> Option<Page> {
             FontId::proportional(10.5),
             col,
         );
-        if ui.interact(r, ui.id().with(("nav", i)), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
+    }
+    let mut goto = None;
+    for (i, (pg, label, _icon)) in items.iter().enumerate() {
+        let r = Rect::from_min_size(rect.min + Vec2::new(pad + iw * i as f32, 7.0), Vec2::new(iw, 52.0));
+        let btn = egui::Button::new(RichText::new(*label).color(Color32::TRANSPARENT).size(10.5))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(20.0);
+        if ui.put(r, btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             goto = Some(*pg);
         }
     }
@@ -797,24 +834,37 @@ fn nav_bar(ui: &mut egui::Ui, page: Page) -> Option<Page> {
 }
 
 /// TunnelWorkersSlider: dots + knob (csqtt workers slider).
+/// Перетаскивание плавное: knob под курсором, значение квантуется группами по 9.
 fn power_dots(ui: &mut egui::Ui, power: &mut usize, max: usize, on_change: &mut dyn FnMut()) {
     let groups = (max / WORKERS_PER_GROUP).max(2);
     let before = *power;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Мощность").strong().color(ON_SURF).size(14.5));
+        ui.label(RichText::new("Мощность").strong().color(th().ON_SURF).size(14.5));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{power} потоков")).color(ON_SURF_VAR).size(12.5));
+            ui.label(RichText::new(format!("{power} потоков")).color(th().ON_SURF_VAR).size(12.5));
         });
     });
-    let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), 26.0));
-    let resp = ui.interact(rect, ui.id().with("power-dots"), Sense::click_and_drag());
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click_and_drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let painter = ui.painter();
-    let track_l = rect.left() + 8.0;
-    let track_w = (rect.width() - 16.0).max(1.0);
+    let knob = 9.0f32;
+    let pad = knob + 3.0;
+    let track_l = rect.left() + pad;
+    let track_w = (rect.width() - 2.0 * pad).max(1.0);
     let cy = rect.center().y;
+    let mut frac_drag: Option<f32> = None;
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let f = ((pos.x - track_l) / track_w).clamp(0.0, 1.0);
+            frac_drag = Some(f);
+            let g = ((f * groups as f32).round() as usize).clamp(1, groups);
+            *power = (g * WORKERS_PER_GROUP).min(max);
+        }
+    }
     painter.line_segment(
         [Pos2::new(track_l, cy), Pos2::new(track_l + track_w, cy)],
-        Stroke::new(2.0, OUTLINE_VAR),
+        Stroke::new(2.0, th().OUTLINE_VAR),
     );
     for i in 0..groups {
         let gx = track_l + track_w * (i as f32 / (groups - 1) as f32);
@@ -822,29 +872,20 @@ fn power_dots(ui: &mut egui::Ui, power: &mut usize, max: usize, on_change: &mut 
         painter.circle_filled(
             Pos2::new(gx, cy),
             3.0,
-            if filled { PRIMARY } else { OUTLINE_VAR },
+            if filled { th().PRIMARY } else { th().OUTLINE_VAR },
         );
     }
-    let frac = (*power as f32 / max as f32).clamp(0.0, 1.0);
+    let frac = frac_drag.unwrap_or((*power as f32 / max as f32).clamp(0.0, 1.0));
     let kx = track_l + track_w * frac;
     painter.line_segment(
         [Pos2::new(track_l, cy), Pos2::new(kx, cy)],
-        Stroke::new(2.5, PRIMARY),
+        Stroke::new(2.5, th().PRIMARY),
     );
-    painter.circle_filled(Pos2::new(kx, cy), 9.0, PRIMARY);
-    painter.circle_filled(Pos2::new(kx, cy), 4.0, ON_PRIMARY);
-    if (resp.dragged() || resp.clicked())
-        && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
-    {
-        let f = ((pos.x - track_l) / track_w).clamp(0.0, 1.0);
-        let mut g = (f * groups as f32).round() as usize;
-        if g < 1 {
-            g = 1;
-        }
-        *power = (g * WORKERS_PER_GROUP).min(max);
-    }
+    painter.circle_filled(Pos2::new(kx, cy), knob, th().PRIMARY);
+    painter.circle_filled(Pos2::new(kx, cy), 4.0, th().ON_PRIMARY);
     if *power != before {
         on_change();
+        ui.ctx().request_repaint();
     }
 }
 
@@ -877,10 +918,12 @@ struct App {
     connect_error: Option<String>,
     captcha_answer: String,
     connected_at: Option<Instant>,
+    dark: bool,
+    vk_rx: Option<Receiver<Result<String, String>>>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(dark: bool) -> Self {
         let (log_tx, log_rx) = mpsc::channel::<String>();
         *log_tx_slot().lock().unwrap() = Some(log_tx);
         csqtt_core::set_log_callback(Box::new(push_log));
@@ -910,6 +953,8 @@ impl App {
             connect_error: None,
             captcha_answer: String::new(),
             connected_at: None,
+            dark,
+            vk_rx: None,
         }
     }
 
@@ -1002,6 +1047,24 @@ impl App {
                 UiEvent::State(s) => self.state = s,
                 UiEvent::Alert(msg) => self.alert = Some(msg),
             }
+        }
+    }
+
+    /// VK-вход: в Windows — маленькое WebView2-окошко с автоперехватом токена;
+    /// иначе — системный браузер + ручная вставка ссылки.
+    fn start_vk_login(&mut self) {
+        #[cfg(windows)]
+        {
+            let (tx, rx) = mpsc::channel();
+            vk_login::start(VK_AUTH_URL.to_string(), tx);
+            self.vk_rx = Some(rx);
+            self.alert =
+                Some("Окошко входа открыто — войди в нём, токен подставится сам.".into());
+        }
+        #[cfg(not(windows))]
+        {
+            open_browser(VK_AUTH_URL);
+            self.paste_open = true;
         }
     }
 
@@ -1191,17 +1254,17 @@ impl App {
         // header: wordmark + actions (CsqttScreen)
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("CSQTT").strong().color(ON_BG).size(21.0));
-                ui.label(RichText::new("v2.5.0 · desktop").color(ON_SURF_VAR).size(11.0));
+                ui.label(RichText::new("CSQTT").strong().color(th().ON_BG).size(21.0));
+                ui.label(RichText::new("v2.5.0 · desktop").color(th().ON_SURF_VAR).size(11.0));
             });
         });
 
         let active = !matches!(self.state, ConnState::Disconnected);
         let status = match self.state {
-            ConnState::Connected => ("Подключено", PRIMARY),
-            ConnState::Connecting => ("Подключение", PRIMARY),
-            ConnState::Disconnecting => ("Ожидание", TERTIARY),
-            ConnState::Disconnected => ("Отключено", ON_SURF_VAR),
+            ConnState::Connected => ("Подключено", th().PRIMARY),
+            ConnState::Connecting => ("Подключение", th().PRIMARY),
+            ConnState::Disconnecting => ("Ожидание", th().TERTIARY),
+            ConnState::Disconnected => ("Отключено", th().ON_SURF_VAR),
         };
 
         // центральная карточка подключения
@@ -1214,18 +1277,18 @@ impl App {
                 let p = ui.painter();
                 let r = 84.0f32 * if active { 1.06 } else { 0.96 };
                 if active {
-                    p.circle_filled(c, r + 12.0, PRIMARY.linear_multiply(0.10));
+                    p.circle_filled(c, r + 12.0, th().PRIMARY.linear_multiply(0.10));
                 }
-                p.circle_filled(c, r, if active { PRIMARY } else { SURF_VAR });
+                p.circle_filled(c, r, if active { th().PRIMARY } else { th().SURF_VAR });
                 let ring = match self.state {
-                    ConnState::Connected | ConnState::Connecting => PRIMARY,
-                    ConnState::Disconnecting => TERTIARY,
-                    ConnState::Disconnected => OUTLINE_VAR,
+                    ConnState::Connected | ConnState::Connecting => th().PRIMARY,
+                    ConnState::Disconnecting => th().TERTIARY,
+                    ConnState::Disconnected => th().OUTLINE_VAR,
                 };
                 p.circle_stroke(c, r, Stroke::new(2.0, ring));
                 let gc = c + Vec2::new(0.0, 4.0);
                 let gr = r * 0.32;
-                let gcol = if active { ON_PRIMARY } else { ON_SURF_VAR.linear_multiply(0.55) };
+                let gcol = if active { th().ON_PRIMARY } else { th().ON_SURF_VAR.linear_multiply(0.55) };
                 power_glyph(p, gc, gr, Stroke::new(3.0, gcol));
                 if resp.clicked() {
                     toggle = true;
@@ -1240,9 +1303,9 @@ impl App {
                     RichText::new(up)
                         .strong()
                         .color(if matches!(self.state, ConnState::Connected) {
-                            PRIMARY
+                            th().PRIMARY
                         } else {
-                            ON_SURF_VAR.linear_multiply(0.7)
+                            th().ON_SURF_VAR.linear_multiply(0.7)
                         })
                         .size(14.0),
                 );
@@ -1254,7 +1317,7 @@ impl App {
                             fmt_bytes(self.stats.1),
                             fmt_bytes(self.stats.2)
                         ))
-                        .color(ON_SURF_VAR)
+                        .color(th().ON_SURF_VAR)
                         .size(11.5),
                     );
                 }
@@ -1270,7 +1333,7 @@ impl App {
 
         if let Some(err) = self.connect_error.clone() {
             ui.add_space(12.0);
-            if banner(ui, &err, ERR_CONT, ON_ERR_CONT).clicked() {
+            if banner(ui, &err, th().ERR_CONT, th().ON_ERR_CONT).clicked() {
                 self.connect_error = None;
             }
         }
@@ -1292,8 +1355,8 @@ impl App {
         ui.horizontal(|ui| {
             let resp = ui.add_sized(
                 Vec2::new((ui.available_width() - 160.0).max(120.0), 44.0),
-                egui::Button::new(RichText::new(active_name).color(ON_SURF_VAR).size(13.0))
-                    .fill(SURF_VAR)
+                egui::Button::new(RichText::new(active_name).color(th().ON_SURF_VAR).size(13.0))
+                    .fill(th().SURF_VAR)
                     .corner_radius(22.0),
             );
             let r = resp.rect;
@@ -1303,11 +1366,11 @@ impl App {
             let ch = if self.picker_open { -3.0 } else { 3.0 };
             p.line_segment(
                 [Pos2::new(cx - 4.0, cy - ch), Pos2::new(cx, cy + ch * 0.4)],
-                Stroke::new(1.6, ON_SURF_VAR),
+                Stroke::new(1.6, th().ON_SURF_VAR),
             );
             p.line_segment(
                 [Pos2::new(cx, cy + ch * 0.4), Pos2::new(cx + 4.0, cy - ch)],
-                Stroke::new(1.6, ON_SURF_VAR),
+                Stroke::new(1.6, th().ON_SURF_VAR),
             );
             let popup_id = ui.id().with("profile-popup");
             if resp.clicked() {
@@ -1326,7 +1389,7 @@ impl App {
                     for p in &self.store.profiles {
                         let on = Some(p.id) == self.store.active_profile_id;
                         if ui
-                            .selectable_label(on, RichText::new(&p.name).color(ON_SURF).size(13.0))
+                            .selectable_label(on, RichText::new(&p.name).color(th().ON_SURF).size(13.0))
                             .clicked()
                         {
                             selected = Some(p.id);
@@ -1335,13 +1398,13 @@ impl App {
                 },
             );
 
-            if pill_button_outlined(ui, "Изменить", Vec2::new(96.0, 44.0), ON_SURF_VAR).clicked() {
+            if pill_button_outlined(ui, "Изменить", Vec2::new(96.0, 44.0), th().ON_SURF_VAR).clicked() {
                 edit_active = true;
             }
             let pr = ui.add_sized(
                 Vec2::splat(44.0),
-                egui::Button::new(RichText::new("+").strong().color(ON_PRIMARY).size(20.0))
-                    .fill(PRIMARY)
+                egui::Button::new(RichText::new("+").strong().color(th().ON_PRIMARY).size(20.0))
+                    .fill(th().PRIMARY)
                     .corner_radius(22.0),
             );
             if pr.clicked() {
@@ -1374,16 +1437,16 @@ impl App {
 
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Логи").strong().color(ON_BG).size(19.0));
+            ui.label(RichText::new("Логи").strong().color(th().ON_BG).size(19.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .small_button(RichText::new("Очистить").color(ON_SURF_VAR).size(12.0))
+                    .small_button(RichText::new("Очистить").color(th().ON_SURF_VAR).size(12.0))
                     .clicked()
                 {
                     self.logs.clear();
                 }
                 if ui
-                    .small_button(RichText::new("Копировать").color(ON_SURF_VAR).size(12.0))
+                    .small_button(RichText::new("Копировать").color(th().ON_SURF_VAR).size(12.0))
                     .clicked()
                 {
                     let text = self.logs.iter().cloned().collect::<Vec<_>>().join("\n");
@@ -1395,10 +1458,10 @@ impl App {
 
         let term_h = (ui.available_height() - 110.0).max(140.0);
         Frame::new()
-            .fill(TERM_BG)
+            .fill(th().TERM_BG)
             .corner_radius(CornerRadius::same(24))
             .inner_margin(Margin::symmetric(14, 12))
-            .stroke(Stroke::new(1.0, CARD_BORDER))
+            .stroke(Stroke::new(1.0, th().CARD_BORDER))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ScrollArea::vertical()
@@ -1408,18 +1471,18 @@ impl App {
                     .show(ui, |ui| {
                         for line in &self.logs {
                             let color = if line.contains("[ОШИБКА]") || line.contains("FATAL") {
-                                TERM_ERR
+                                th().TERM_ERR
                             } else if line.contains("[ВК]") || line.contains("[АВТО API]") {
-                                INFO
+                                th().INFO
                             } else if line.contains("[КАПЧА]") {
-                                WARNING
+                                th().WARNING
                             } else if line.contains("сохранён")
                                 || line.contains("создан")
                                 || line.contains("заверш")
                             {
-                                TERM_OK
+                                th().TERM_OK
                             } else {
-                                TERM_MUTED
+                                th().TERM_MUTED
                             };
                             ui.label(RichText::new(line).monospace().size(11.5).color(color));
                         }
@@ -1451,7 +1514,7 @@ impl App {
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Настройки").strong().color(ON_BG).size(19.0));
+            ui.label(RichText::new("Настройки").strong().color(th().ON_BG).size(19.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icon_button(ui, "close", 36.0).clicked() {
                     self.page = Page::Connect;
@@ -1475,7 +1538,7 @@ impl App {
                 |ui| {
                     if has_token {
                         if ui
-                            .small_button(RichText::new("Сброс ВК").color(ERR).size(12.5))
+                            .small_button(RichText::new("Сброс ВК").color(th().ERR).size(12.5))
                             .clicked()
                         {
                             delete_vk_token();
@@ -1486,13 +1549,12 @@ impl App {
                 },
             );
             if login {
-                open_browser(VK_AUTH_URL);
-                self.paste_open = true;
+                self.start_vk_login();
             }
             let (dot, txt) = if has_token {
-                (SUCCESS, "токен установлен")
+                (th().SUCCESS, "токен установлен")
             } else {
-                (ON_SURF_VAR.linear_multiply(0.6), "токен не установлен")
+                (th().ON_SURF_VAR.linear_multiply(0.6), "токен не установлен")
             };
             ui.label(RichText::new(format!("● {txt}")).color(dot).size(12.0));
             if self.paste_open && !has_token {
@@ -1531,7 +1593,7 @@ impl App {
                 ui,
                 "work",
                 &cur,
-                &["Капча", "Звонки", "Авто ВК"],
+                &seg_opts(&["Капча", "Звонки", "Авто ВК"]),
                 &mut |v: &str| {
                     changed = true;
                     s.work_mode = v.to_string();
@@ -1543,7 +1605,7 @@ impl App {
             let need_work_token = s.work_mode == "Авто ВК";
             if need_work_token && !has_token {
                 ui.add_space(8.0);
-                banner(ui, "требуется авторизация ВКонтакте", WARN_CONT, ON_WARN_CONT);
+                banner(ui, "требуется авторизация ВКонтакте", th().WARN_CONT, th().ON_WARN_CONT);
             }
             separator(ui);
 
@@ -1553,7 +1615,7 @@ impl App {
                 ui,
                 "hashes",
                 &cur,
-                &["Ручной", "Авто API", "Авто ВК"],
+                &seg_opts(&["Ручной", "Авто API", "Авто ВК"]),
                 &mut |v: &str| {
                     changed = true;
                     s.hashes = v.to_string();
@@ -1566,13 +1628,13 @@ impl App {
                     .fill(Color32::TRANSPARENT)
                     .corner_radius(CornerRadius::same(18))
                     .inner_margin(Margin::symmetric(14, 10))
-                    .stroke(Stroke::new(1.2, OUTLINE.linear_multiply(0.45)))
+                    .stroke(Stroke::new(1.2, th().OUTLINE.linear_multiply(0.45)))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.add(
                             egui::TextEdit::multiline(&mut s.custom_hashes)
-                                .hint_text(RichText::new("Хеши через запятую").color(ON_SURF_VAR.linear_multiply(0.6)))
-                                .text_color(ON_SURF)
+                                .hint_text(RichText::new("Хеши через запятую").color(th().ON_SURF_VAR.linear_multiply(0.6)))
+                                .text_color(th().ON_SURF)
                                 .desired_width(f32::INFINITY)
                                 .desired_rows(2)
                                 .frame(false),
@@ -1582,13 +1644,13 @@ impl App {
             }
             if (s.hashes == "Авто API" || s.hashes == "Авто ВК") && !has_token {
                 ui.add_space(8.0);
-                banner(ui, "требуется авторизация ВКонтакте", WARN_CONT, ON_WARN_CONT);
+                banner(ui, "требуется авторизация ВКонтакте", th().WARN_CONT, th().ON_WARN_CONT);
             }
             separator(ui);
 
             setting_label(ui, "Маскировка");
             let cur = s.masking.clone();
-            segmented(ui, "mask", &cur, &["Простая", "Средняя"], &mut |v: &str| {
+            segmented(ui, "mask", &cur, &seg_opts(&["Простая", "Средняя"]), &mut |v: &str| {
                 changed = true;
                 s.masking = v.to_string();
             });
@@ -1600,7 +1662,7 @@ impl App {
                 ui,
                 "fp",
                 &cur,
-                &["Firefox", "Safari", "Chrome"],
+                &seg_opts(&["Firefox", "Safari", "Chrome"]),
                 &mut |v: &str| {
                     changed = true;
                     s.fingerprint = v.to_string();
@@ -1610,7 +1672,7 @@ impl App {
 
             setting_row(ui, "Экстра потоки", Some("максимум мощности профиля до 162"), |ui| {
                 let on = s.extra_threads;
-                switch_pill(ui, on, &mut |v| {
+                switch_pill(ui, on, "Экстра потоки", &mut |v| {
                     changed = true;
                     s.extra_threads = v;
                 });
@@ -1626,7 +1688,7 @@ impl App {
                 egui::Button::new(
                     RichText::new(if self.adv_open { "▾  Расширенные" } else { "▸  Расширенные" })
                         .strong()
-                        .color(ON_SURF)
+                        .color(th().ON_SURF)
                         .size(14.5),
                 )
                 .fill(Color32::TRANSPARENT)
@@ -1637,7 +1699,7 @@ impl App {
             }
             if self.adv_open {
                 separator(ui);
-                setting_label(ui, "TURN");
+                setting_label_i(ui, "TURN", DOC_TURN);
                 let old = s.turn.clone();
                 ui.horizontal_wrapped(|ui| {
                     pill_field(ui, &mut s.turn, "TURN host[:port] · пусто = авто-подбор", 380.0);
@@ -1651,29 +1713,57 @@ impl App {
                 });
                 changed |= s.custom_turn_ips != old;
                 ui.add_space(6.0);
-                setting_label(ui, "Транспорт TURN");
+                setting_label_i(ui, "Транспорт TURN", DOC_TURN_TRANSPORT);
                 let cur = s.turn_transport.clone();
-                segmented(ui, "turntr", &cur, &["udp", "tcp"], &mut |v: &str| {
+                segmented(ui, "turntr", &cur, &[("udp", "UDP"), ("tcp", "TCP")], &mut |v: &str| {
                     changed = true;
                     s.turn_transport = v.to_string();
                 });
                 separator(ui);
 
-                setting_label(ui, "SRTP");
+                setting_label_i(ui, "SRTP", DOC_SRTP);
                 let cur = s.srtp_mode.clone();
-                segmented(ui, "srtp", &cur, &["auto", "wrap", "dtls"], &mut |v: &str| {
+                segmented(ui, "srtp", &cur, &[("auto", "AUTO"), ("wrap", "WRAP"), ("dtls", "DTLS")], &mut |v: &str| {
                     changed = true;
                     s.srtp_mode = v.to_string();
                 });
                 ui.add_space(6.0);
-                setting_label(ui, "Капча");
-                let cur = s.captcha_mode.clone();
-                segmented(ui, "cap", &cur, &["auto", "rjs", "wv"], &mut |v: &str| {
-                    changed = true;
-                    s.captcha_mode = v.to_string();
-                });
+                setting_label_i(ui, "Капча", DOC_CAPTCHA);
+                let auto = s.captcha_mode == "auto";
+                setting_row(
+                    ui,
+                    "Системный выбор",
+                    Some("ядро само подберёт решатель капчи"),
+                    |ui| {
+                        let on = auto;
+                        switch_pill(ui, on, "Капча системный выбор", &mut |v| {
+                            changed = true;
+                            s.captcha_mode = if v { "auto".into() } else { "rjs".into() };
+                        });
+                    },
+                );
+                if auto {
+                    ui.label(
+                        RichText::new("вид капчи выбирает система")
+                            .color(th().ON_SURF_VAR.linear_multiply(0.7))
+                            .size(11.0),
+                    );
+                } else {
+                    ui.add_space(4.0);
+                    let cur = s.captcha_mode.clone();
+                    segmented(
+                        ui,
+                        "cap",
+                        &cur,
+                        &[("rjs", "RJS"), ("wv", "WV")],
+                        &mut |v: &str| {
+                            changed = true;
+                            s.captcha_mode = v.to_string();
+                        },
+                    );
+                }
                 ui.add_space(6.0);
-                setting_label(ui, "Локальный адрес (listen)");
+                setting_label_i(ui, "Локальный адрес (LISTEN)", DOC_LISTEN);
                 let old = s.listen.clone();
                 ui.horizontal_wrapped(|ui| {
                     pill_field(ui, &mut s.listen, "127.0.0.1:9000", 380.0);
@@ -1686,7 +1776,7 @@ impl App {
                     Some("отсеивать мёртвые хеши до запуска туннелей"),
                     |ui| {
                         let on = s.validate_hashes;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Проверять хеши ВК", &mut |v| {
                             changed = true;
                             s.validate_hashes = v;
                         });
@@ -1700,7 +1790,7 @@ impl App {
                     Some("часть трафика идёт напрямую, минуя туннель"),
                     |ui| {
                         let on = s.domain_routing;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Маршрутизация по доменам", &mut |v| {
                             changed = true;
                             s.domain_routing = v;
                         });
@@ -1710,21 +1800,21 @@ impl App {
                     ui.add_space(4.0);
                     setting_row(ui, "Исключить RU-зоны", None, |ui| {
                         let on = s.exclude_ru_zones;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Исключить RU-зоны", &mut |v| {
                             changed = true;
                             s.exclude_ru_zones = v;
                         });
                     });
                     setting_row(ui, "Шаблонные домены", None, |ui| {
                         let on = s.template_domains;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Шаблонные домены", &mut |v| {
                             changed = true;
                             s.template_domains = v;
                         });
                     });
                     setting_row(ui, "Только белый список", None, |ui| {
                         let on = s.domain_whitelist;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Белый список доменов", &mut |v| {
                             changed = true;
                             s.domain_whitelist = v;
                         });
@@ -1744,7 +1834,7 @@ impl App {
                     Some("часть подсетей идёт напрямую, минуя туннель"),
                     |ui| {
                         let on = s.ip_routing;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Маршрутизация по IP", &mut |v| {
                             changed = true;
                             s.ip_routing = v;
                         });
@@ -1754,7 +1844,7 @@ impl App {
                     ui.add_space(4.0);
                     setting_row(ui, "Только белый список", None, |ui| {
                         let on = s.ip_whitelist;
-                        switch_pill(ui, on, &mut |v| {
+                        switch_pill(ui, on, "Белый список IP", &mut |v| {
                             changed = true;
                             s.ip_whitelist = v;
                         });
@@ -1772,7 +1862,7 @@ impl App {
         ui.label(
             RichText::new("настройки применяются автоматически, кнопка «Сохранить» не нужна")
                 .italics()
-                .color(ON_SURF_VAR.linear_multiply(0.7))
+                .color(th().ON_SURF_VAR.linear_multiply(0.7))
                 .size(11.0),
         );
 
@@ -1786,7 +1876,7 @@ impl App {
 
     fn ui_info(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Инфо").strong().color(ON_BG).size(19.0));
+            ui.label(RichText::new("Инфо").strong().color(th().ON_BG).size(19.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icon_button(ui, "close", 36.0).clicked() {
                     self.page = Page::Connect;
@@ -1798,9 +1888,9 @@ impl App {
         cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("csqtt-desktop · v1.1 (ядро csqtt 2.5.0)")
+                RichText::new("csqtt-desktop · v1.2 (ядро csqtt 2.5.0)")
                     .strong()
-                    .color(ON_SURF)
+                    .color(th().ON_SURF)
                     .size(14.5),
             );
             ui.add_space(8.0);
@@ -1811,7 +1901,7 @@ impl App {
                  проекта не используются.",
                 "Профили, настройки и VK-токен хранятся только на этом компьютере.",
             ] {
-                ui.label(RichText::new(line).color(ON_SURF_VAR).size(12.5));
+                ui.label(RichText::new(line).color(th().ON_SURF_VAR).size(12.5));
                 ui.add_space(6.0);
             }
             ui.add_space(8.0);
@@ -1823,7 +1913,7 @@ impl App {
                     ui,
                     "Скачать новую версию",
                     Vec2::new(196.0, 42.0),
-                    ON_SURF_VAR,
+                    th().ON_SURF_VAR,
                 )
                 .clicked()
                 {
@@ -1861,7 +1951,7 @@ impl App {
                     ui.label(
                         RichText::new("Редактировать профиль")
                             .strong()
-                            .color(ON_SURF)
+                            .color(th().ON_SURF)
                             .size(15.0),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1896,7 +1986,7 @@ impl App {
                         close = true;
                     }
                     if ui
-                        .button(RichText::new("Удалить").color(ERR).size(13.5))
+                        .button(RichText::new("Удалить").color(th().ERR).size(13.5))
                         .clicked()
                     {
                         deleted = true;
@@ -1929,7 +2019,7 @@ impl App {
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.set_max_width(360.0);
-                ui.label(RichText::new(msg).color(ON_SURF).size(13.5));
+                ui.label(RichText::new(msg).color(th().ON_SURF).size(13.5));
                 ui.add_space(10.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if pill_button(ui, "ОК", Vec2::new(88.0, 36.0)).clicked() {
@@ -1942,21 +2032,45 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BG;
-        visuals.window_fill = CARD;
-        visuals.extreme_bg_color = SURFACE;
-        visuals.window_stroke = Stroke::new(1.0, CARD_BORDER);
+        let mut visuals = if self.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
+        visuals.panel_fill = th().BG;
+        visuals.window_fill = th().CARD;
+        visuals.extreme_bg_color = th().SURFACE;
+        visuals.window_stroke = Stroke::new(1.0, th().CARD_BORDER);
         visuals.menu_corner_radius = CornerRadius::same(18);
-        visuals.faint_bg_color = SURF_VAR;
-        visuals.widgets.noninteractive.fg_stroke.color = ON_BG;
-        visuals.widgets.inactive.bg_fill = SURF_VAR;
-        visuals.widgets.hovered.bg_fill = PRIMARY_CONT;
-        visuals.selection.bg_fill = PRIMARY_CONT;
-        visuals.selection.stroke = Stroke::new(1.0, PRIMARY);
+        visuals.faint_bg_color = th().SURF_VAR;
+        visuals.widgets.noninteractive.fg_stroke.color = th().ON_BG;
+        visuals.widgets.inactive.bg_fill = th().SURF_VAR;
+        visuals.widgets.hovered.bg_fill = th().PRIMARY_CONT;
+        visuals.selection.bg_fill = th().PRIMARY_CONT;
+        visuals.selection.stroke = Stroke::new(1.0, th().PRIMARY);
         ctx.set_visuals(visuals);
 
         self.drain_channels();
+
+        if let Some(rx) = &self.vk_rx {
+            match rx.try_recv() {
+                Ok(Ok(tok)) => {
+                    self.vk_rx = None;
+                    if save_vk_token(&tok) {
+                        self.alert = Some("Токен ВКонтакте сохранён".into());
+                    } else {
+                        self.alert = Some("Не удалось разобрать токен".into());
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.vk_rx = None;
+                    self.alert = Some(e);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vk_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if self.state == ConnState::Connected {
             if self.connected_at.is_none() {
                 self.connected_at = Some(Instant::now());
@@ -1969,7 +2083,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("nav")
             .frame(
                 Frame::new()
-                    .fill(BG)
+                    .fill(th().BG)
                     .inner_margin(Margin { left: 20, right: 20, top: 6, bottom: 14 }),
             )
             .show(ctx, |ui| {
@@ -1980,7 +2094,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(BG)
+                    .fill(th().BG)
                     .inner_margin(Margin { left: 20, right: 20, top: 12, bottom: 12 }),
             )
             .show(ctx, |ui| match self.page {
@@ -2006,27 +2120,42 @@ impl eframe::App for App {
         self.ui_editor(ctx);
         self.ui_alert(ctx);
 
-        static DEBUG_DONE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !DEBUG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let _ = std::fs::write(
-                app_dir().join("debug.txt"),
-                format!(
-                    "screen_rect={:?} ppp={} os_ppp={}",
-                    ctx.screen_rect().size(),
-                    ctx.pixels_per_point(),
-                    os_scale_factor()
-                ),
-            );
-        }
-
-        ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        ctx.request_repaint_after(Duration::from_millis(60));
     }
+}
+
+/// Inter — основной шрифт (кириллица есть); Bold → Inter SemiBold.
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "inter".into(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Inter-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "inter_semibold".into(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Inter-SemiBold.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "inter".into());
+    // egui 0.31: RichText::strong() меняет только цвет; SemBold подключаем
+    // как fallback сразу за Regular — тяжёлые галереи сами его не выбирают,
+    // поэтому оставляем единый Inter Regular.
+    let _ = &fonts.font_data["inter_semibold"];
+    ctx.set_fonts(fonts);
 }
 
 fn main() -> eframe::Result {
     force_dpi_awareness();
     install_embedded_wintun();
+    let dark = theme::detect_dark();
+    theme::install(dark);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([470.0, 860.0])
@@ -2037,7 +2166,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "csqtt-desktop",
         opts,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |cc| {
+            setup_fonts(&cc.egui_ctx);
+            Ok(Box::new(App::new(dark)))
+        }),
     )
 }
 
@@ -2060,21 +2192,120 @@ fn force_dpi_awareness() {
 #[cfg(not(windows))]
 fn force_dpi_awareness() {}
 
-#[cfg(windows)]
-fn os_scale_factor() -> f32 {
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn GetDpiForSystem() -> u32;
-    }
-    let dpi = unsafe { GetDpiForSystem() };
-    if dpi == 0 {
-        1.0
-    } else {
-        dpi as f32 / 96.0
-    }
-}
 
-#[cfg(not(windows))]
-fn os_scale_factor() -> f32 {
-    1.0
+// ───────────────────────────── UI-тесты (egui_kittest) ─────────────────────────────
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+
+    fn harness<'a>() -> Harness<'a, App> {
+        theme::install(true);
+        Harness::builder()
+            .with_size(Vec2::new(560.0, 900.0))
+            // фоновый request_repaint_after(60ms) в update() иначе бесконечно
+            // продлевает жизнь try_run(): шаг должен быть короче таймера.
+            .with_step_dt(0.01)
+            .build_eframe(|_cc| App::new(true))
+    }
+
+    fn settings<'a, 'b>(h: &'b Harness<'a, App>) -> &'b Settings {
+        h.state().store.settings.as_ref().unwrap()
+    }
+
+    #[test]
+    fn nav_switches_pages_and_info_has_repo_button() {
+        let mut h = harness();
+        h.run_steps(2);
+        assert_eq!(h.state().page, Page::Connect);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        assert_eq!(h.state().page, Page::Settings);
+        h.get_by_label("Инфо").click();
+        h.run_steps(2);
+        assert_eq!(h.state().page, Page::Info);
+        assert!(h.query_by_label("Репозиторий GitHub").is_some());
+        assert!(h.query_by_label("Скачать новую версию").is_some());
+    }
+
+    #[test]
+    fn adv_srtp_segmented_is_caps_and_changes_value() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        h.get_by_label_contains("Расширенные").click();
+        h.run_steps(2);
+        assert!(h.state().adv_open);
+        // Аббревиатуры — большими буквами.
+        assert!(h.query_by_label("AUTO").is_some());
+        assert!(h.query_by_label("WRAP").is_some());
+        assert!(h.query_by_label("DTLS").is_some());
+        assert!(h.query_by_label("UDP").is_some());
+        assert!(h.query_by_label("TCP").is_some());
+        h.get_by_label("WRAP").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).srtp_mode, "wrap");
+        h.get_by_label("DTLS").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).srtp_mode, "dtls");
+    }
+
+    #[test]
+    fn captcha_segmented_hidden_until_switch_off() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        h.get_by_label_contains("Расширенные").click();
+        h.run_steps(2);
+        // По умолчанию «система»: сегментов RJS/WV нет, switch включён.
+        assert_eq!(settings(&h).captcha_mode, "auto");
+        assert!(h.query_by_label("RJS").is_none());
+        assert!(h.query_by_label("WV").is_none());
+        // Выключаем системный выбор → появляются RJS/WV, значение rjs.
+        h.get_by_label_contains("Капча системный выбор").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).captcha_mode, "rjs");
+        assert!(h.query_by_label("RJS").is_some());
+        h.get_by_label("WV").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).captcha_mode, "wv");
+        // Включаем систему обратно → сегменты снова скрыты.
+        h.get_by_label_contains("Капча системный выбор").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).captcha_mode, "auto");
+        assert!(h.query_by_label("RJS").is_none());
+    }
+
+    #[test]
+    fn switches_toggle_state() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        h.get_by_label_contains("Расширенные").click();
+        h.run_steps(2);
+        let before = settings(&h).validate_hashes;
+        // двоеточие отличает кнопку-switch от текстовой подписи строки
+        h.get_by_label_contains("Проверять хеши ВК:").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).validate_hashes, !before);
+    }
+
+    #[test]
+    fn info_dot_popups_exist() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        h.get_by_label_contains("Расширенные").click();
+        h.run_steps(2);
+        // Кнопки ⓘ существуют (по одной на TURN/Транспорт/SRTP/Капча/LISTEN).
+        let dots = h
+            .query_all_by(|n| n.label().is_some_and(|l| l == "i"))
+            .count();
+        assert!(dots >= 5, "info dots: {dots}");
+    }
 }
