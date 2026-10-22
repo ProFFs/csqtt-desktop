@@ -169,6 +169,11 @@ pub fn set_events_enabled(enabled: bool) {
     EVENTS_FORCED.store(enabled, Ordering::Release);
 }
 
+/// Есть активный решатель капчи — GUI показывает поле ответа.
+pub fn captcha_active() -> bool {
+    ACTIVE_CAPTCHA.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
 /// Канал управления активной сессией (замена stdin для встроенного режима)
 static CONTROL_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
     Mutex::new(None);

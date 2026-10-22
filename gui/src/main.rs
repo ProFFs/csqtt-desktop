@@ -119,7 +119,7 @@ impl Default for Profile {
             id: 0,
             name: "Профиль".into(),
             ip: String::new(),
-            port: "46000".into(),
+            port: String::new(),
             password: String::new(),
             power: 9,
         }
@@ -591,7 +591,8 @@ fn switch_pill(ui: &mut egui::Ui, on: bool, label: &str, on_toggle: &mut dyn FnM
             Stroke::new(1.0, th().OUTLINE),
             StrokeKind::Inside,
         );
-        p.circle_filled(Pos2::new(track.left() + 8.0, cy), 6.0, th().OUTLINE);
+        // тот же отступ, что у включённого: центр в 12 от края дорожки
+        p.circle_filled(Pos2::new(track.left() + 12.0, cy), 9.0, th().OUTLINE);
     }
 }
 
@@ -636,24 +637,59 @@ fn setting_label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// ⓘ — кнопка с полным описанием сокращения (всплывающая подсказка).
-fn info_dot(ui: &mut egui::Ui, text: &str) {
+fn info_dot(ui: &mut egui::Ui, id: &str, text: &str) {
     let r = ui
         .add_sized(
-            Vec2::splat(18.0),
-            egui::Button::new(RichText::new("i").italics().color(th().ON_SURF_VAR).size(11.0))
+            Vec2::splat(20.0),
+            egui::Button::new(RichText::new("i").color(th().ON_SURF_VAR).size(12.5))
                 .fill(Color32::TRANSPARENT)
                 .stroke(Stroke::new(1.0, th().OUTLINE_VAR))
-                .corner_radius(9.0),
+                .corner_radius(10.0),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let pid = egui::Id::new(("doc-pop", id));
+    let mut open = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(pid, false));
+    if r.clicked() {
+        open = !open;
+    }
     r.on_hover_text(RichText::new(text).size(12.0).color(th().ON_SURF));
+    if open {
+        let mut is_open = true;
+        egui::Window::new("doc")
+            .id(egui::Id::new(("doc-win", id)))
+            .frame(cs_dialog(Margin::symmetric(16, 14)))
+            .title_bar(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(360.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Справка").strong().color(th().ON_SURF).size(14.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "close", 30.0).clicked() {
+                            is_open = false;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                for line in text.split('\n') {
+                    if !line.is_empty() {
+                        ui.label(RichText::new(line).color(th().ON_SURF_VAR).size(12.5));
+                        ui.add_space(3.0);
+                    }
+                }
+            });
+        open = is_open;
+    }
+    ui.ctx().data_mut(|d| *d.get_persisted_mut_or(pid, false) = open);
 }
 
-/// setting_label + ⓘ рядом.
+/// setting_label + ⓘ рядом (клик — окно справки, hover — подсказка).
 fn setting_label_i(ui: &mut egui::Ui, text: &str, doc: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(text).strong().color(th().ON_SURF_VAR).size(12.0));
-        info_dot(ui, doc);
+        info_dot(ui, text, doc);
     });
     ui.add_space(6.0);
 }
@@ -690,6 +726,17 @@ fn pill_button(ui: &mut egui::Ui, label: &str, size: Vec2) -> egui::Response {
         egui::Button::new(RichText::new(label).strong().color(th().ON_PRIMARY).size(13.0))
             .fill(th().PRIMARY)
             .corner_radius(size.y / 2.0),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Мелкое действие — скруглённый чип (не квадратная ui.button).
+fn chip(ui: &mut egui::Ui, label: &str, fg: Color32) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).color(fg).size(12.0))
+            .fill(th().SURF_VAR)
+            .corner_radius(13.0)
+            .min_size(Vec2::new(0.0, 26.0)),
     )
     .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -875,7 +922,11 @@ fn power_dots(ui: &mut egui::Ui, power: &mut usize, max: usize, on_change: &mut 
             if filled { th().PRIMARY } else { th().OUTLINE_VAR },
         );
     }
-    let frac = frac_drag.unwrap_or((*power as f32 / max as f32).clamp(0.0, 1.0));
+    let frac = frac_drag.unwrap_or({
+        // knob ровно по точкам-группам: минимум у левого края, максимум у правого
+        let g = (*power / WORKERS_PER_GROUP).clamp(1, groups);
+        (g - 1) as f32 / (groups - 1) as f32
+    });
     let kx = track_l + track_w * frac;
     painter.line_segment(
         [Pos2::new(track_l, cy), Pos2::new(kx, cy)],
@@ -1251,13 +1302,19 @@ impl App {
     // ─────────────────────────── экран: Подключение ───────────────────────────
 
     fn ui_connect(&mut self, ui: &mut egui::Ui) {
-        // header: wordmark + actions (CsqttScreen)
+        // header: wordmark; выбор профиля и добавление — сразу под ним
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("CSQTT").strong().color(th().ON_BG).size(21.0));
                 ui.label(RichText::new("v2.5.0 · desktop").color(th().ON_SURF_VAR).size(11.0));
             });
         });
+        ui.add_space(12.0);
+        self.profile_bar(ui);
+        // карточка с кнопкой подключения — по центру оставшейся высоты
+        let card_h = 330.0f32;
+        let slack = (ui.available_height() - card_h).max(0.0);
+        ui.add_space(slack / 2.0);
 
         let active = !matches!(self.state, ConnState::Disconnected);
         let status = match self.state {
@@ -1338,9 +1395,6 @@ impl App {
             }
         }
 
-        // строка выбора профиля
-        ui.add_space(14.0);
-        self.profile_bar(ui);
     }
 
     fn profile_bar(&mut self, ui: &mut egui::Ui) {
@@ -1439,15 +1493,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Логи").strong().color(th().ON_BG).size(19.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .small_button(RichText::new("Очистить").color(th().ON_SURF_VAR).size(12.0))
-                    .clicked()
+                if chip(ui, "Очистить", th().ON_SURF_VAR).clicked()
                 {
                     self.logs.clear();
                 }
-                if ui
-                    .small_button(RichText::new("Копировать").color(th().ON_SURF_VAR).size(12.0))
-                    .clicked()
+                if chip(ui, "Копировать", th().ON_SURF_VAR).clicked()
                 {
                     let text = self.logs.iter().cloned().collect::<Vec<_>>().join("\n");
                     ui.output_mut(|o| o.copied_text = text);
@@ -1466,6 +1516,7 @@ impl App {
                 ui.set_width(ui.available_width());
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .stick_to_bottom(true)
                     .max_height(term_h - 24.0)
                     .show(ui, |ui| {
@@ -1489,25 +1540,27 @@ impl App {
                     });
             });
 
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let mut ans = self.captcha_answer.clone();
-            pill_field(
-                ui,
-                &mut ans,
-                "Ответ капчи: success_token / error:...",
-                (ui.available_width() - 130.0).max(200.0),
-            );
-            let send = pill_button(ui, "Отправить", Vec2::new(112.0, 40.0)).clicked();
-            self.captcha_answer = ans;
-            if send && !self.captcha_answer.trim().is_empty() {
-                let a = self.captcha_answer.trim().to_string();
-                if !csqtt_core::submit_captcha_result(a) {
-                    push_log("[КАПЧА] ядро не приняло ответ (нет ожидания)".into());
+        if csqtt_core::captcha_active() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let mut ans = self.captcha_answer.clone();
+                pill_field(
+                    ui,
+                    &mut ans,
+                    "токен или error:код",
+                    (ui.available_width() - 130.0).max(200.0),
+                );
+                let send = pill_button(ui, "Отправить", Vec2::new(112.0, 40.0)).clicked();
+                self.captcha_answer = ans;
+                if send && !self.captcha_answer.trim().is_empty() {
+                    let a = self.captcha_answer.trim().to_string();
+                    if !csqtt_core::submit_captcha_result(a) {
+                        push_log("[КАПЧА] ядро не приняло ответ (нет ожидания)".into());
+                    }
+                    self.captcha_answer.clear();
                 }
-                self.captcha_answer.clear();
-            }
-        });
+            });
+        }
     }
 
     // ─────────────────────────── экран: Настройки ───────────────────────────
@@ -1537,9 +1590,7 @@ impl App {
                 Some("нужен для режимов «Авто API» и «Авто ВК»"),
                 |ui| {
                     if has_token {
-                        if ui
-                            .small_button(RichText::new("Сброс ВК").color(th().ERR).size(12.5))
-                            .clicked()
+                        if chip(ui, "Сброс ВК", th().ERR).clicked()
                         {
                             delete_vk_token();
                         }
@@ -1888,7 +1939,7 @@ impl App {
         cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("csqtt-desktop · v1.2 (ядро csqtt 2.5.0)")
+                RichText::new("csqtt-desktop · v1.1 (ядро csqtt 2.5.0)")
                     .strong()
                     .color(th().ON_SURF)
                     .size(14.5),
@@ -1969,8 +2020,8 @@ impl App {
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        pill_field(ui, &mut self.store.profiles[idx].ip, "31.59.104.110", 200.0);
-                        pill_field(ui, &mut self.store.profiles[idx].port, "46000", 110.0);
+                        pill_field(ui, &mut self.store.profiles[idx].ip, "IP или домен", 200.0);
+                        pill_field(ui, &mut self.store.profiles[idx].port, "порт", 110.0);
                     });
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
@@ -1986,7 +2037,18 @@ impl App {
                         close = true;
                     }
                     if ui
-                        .button(RichText::new("Удалить").color(th().ERR).size(13.5))
+                        .add_sized(
+                            Vec2::new(104.0, 40.0),
+                            egui::Button::new(
+                                RichText::new("Удалить")
+                                    .strong()
+                                    .color(th().ON_ERR_CONT)
+                                    .size(13.0),
+                            )
+                            .fill(th().ERR_CONT)
+                            .corner_radius(20.0),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
                         deleted = true;
@@ -2056,10 +2118,9 @@ impl eframe::App for App {
             match rx.try_recv() {
                 Ok(Ok(tok)) => {
                     self.vk_rx = None;
-                    if save_vk_token(&tok) {
-                        self.alert = Some("Токен ВКонтакте сохранён".into());
-                    } else {
-                        self.alert = Some("Не удалось разобрать токен".into());
+                    // молча сохраняем: окошко само закрылось, всплывать нечем
+                    if !save_vk_token(&tok) {
+                        self.alert = Some("Не удалось сохранить токен".into());
                     }
                 }
                 Ok(Err(e)) => {
@@ -2071,6 +2132,13 @@ impl eframe::App for App {
             }
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+        if self.picker_open
+            && (!ctx.input(|i| i.focused) || ctx.input(|i| i.key_pressed(egui::Key::Escape)))
+        {
+            self.picker_open = false;
+            ctx.memory_mut(|m| m.close_popup());
+        }
+
         if self.state == ConnState::Connected {
             if self.connected_at.is_none() {
                 self.connected_at = Some(Instant::now());
@@ -2103,11 +2171,13 @@ impl eframe::App for App {
                 Page::Settings => {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| self.ui_settings(ui));
                 }
                 Page::Info => {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| self.ui_info(ui));
                 }
             });
@@ -2149,6 +2219,11 @@ fn setup_fonts(ctx: &egui::Context) {
     // поэтому оставляем единый Inter Regular.
     let _ = &fonts.font_data["inter_semibold"];
     ctx.set_fonts(fonts);
+    // чуть шире антиалиасинг-переход: мелкие элементы не выглядят «квадратными»
+    ctx.tessellation_options_mut(|o| {
+        o.feathering = true;
+        o.feathering_size_in_pixels = 1.5;
+    });
 }
 
 fn main() -> eframe::Result {
@@ -2158,8 +2233,8 @@ fn main() -> eframe::Result {
     theme::install(dark);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([470.0, 860.0])
-            .with_min_inner_size([420.0, 640.0])
+            .with_inner_size([560.0, 880.0])
+            .with_min_inner_size([520.0, 700.0])
             .with_title("csqtt-desktop"),
         ..Default::default()
     };

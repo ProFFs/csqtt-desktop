@@ -33,7 +33,32 @@ mod imp {
 
     struct State {
         controller: OnceLock<ICoreWebView2Controller>,
+        webview: OnceLock<ICoreWebView2>,
+        tx: OnceLock<Sender<Result<String, String>>>,
         captured: AtomicBool,
+    }
+
+    /// Проверка текущего URL: токен/ошибка -> канал + закрытие окна.
+    /// VK приходит на blank.html#access_token=... — фрагмент не всегда
+    /// порождает NavigationStarting, поэтому нужен и опрос по таймеру.
+    unsafe fn check_url(st: &State, hwnd: HWND) -> bool {
+        let Some(wv) = st.webview.get() else { return false };
+        let Ok(url) = wv.Url() else { return false };
+        let url = url.to_string();
+        let msg = if let Some(tok) = extract_token(&url) {
+            Ok(tok)
+        } else if url.starts_with("https://oauth.vk") && url.contains("error=") {
+            Err("VK вернул ошибку авторизации".to_string())
+        } else {
+            return false;
+        };
+        if !st.captured.swap(true, Ordering::SeqCst) {
+            if let Some(tx) = st.tx.get() {
+                let _ = tx.send(msg);
+            }
+        }
+        let _ = DestroyWindow(hwnd);
+        true
     }
 
     fn user_data_dir() -> String {
@@ -66,11 +91,18 @@ mod imp {
                 }
                 LRESULT(0)
             }
+            WM_TIMER => {
+                if !state.is_null() && unsafe { check_url(&*state, hwnd) } {
+                    return LRESULT(0);
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), 1);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -111,8 +143,12 @@ mod imp {
             )
             .map_err(|_| "не удалось создать окно входа".to_string())?;
 
-            let state: &'static State =
-                Box::leak(Box::new(State { controller: OnceLock::new(), captured: AtomicBool::new(false) }));
+            let state: &'static State = Box::leak(Box::new(State {
+                controller: OnceLock::new(),
+                webview: OnceLock::new(),
+                tx: OnceLock::new(),
+                captured: AtomicBool::new(false),
+            }));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as *const State as isize);
 
             // Среда с отдельным профилем WebView2 (куки — сессия VK переживает перезапуск окна).
@@ -159,6 +195,8 @@ mod imp {
             let _ = controller.SetIsVisible(true);
 
             let webview = controller.CoreWebView2().map_err(|e| format!("WebView2: {e}"))?;
+            let _ = state.webview.set(webview.clone());
+            let _ = state.tx.set(tx.clone());
             if let Ok(settings) = webview.Settings() {
                 let _ = settings.SetIsStatusBarEnabled(false);
                 let _ = settings.SetAreDefaultContextMenusEnabled(false);
@@ -213,6 +251,7 @@ mod imp {
             let _ = state.controller.set(controller);
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
+            SetTimer(Some(hwnd), 1, 300, None);
 
             let mut msg = MSG::default();
             loop {
