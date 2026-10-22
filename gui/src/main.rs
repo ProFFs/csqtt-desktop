@@ -1936,11 +1936,26 @@ impl eframe::App for App {
         self.ui_editor(ctx);
         self.ui_alert(ctx);
 
+        static DEBUG_DONE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !DEBUG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::write(
+                app_dir().join("debug.txt"),
+                format!(
+                    "screen_rect={:?} ppp={} os_ppp={}",
+                    ctx.screen_rect().size(),
+                    ctx.pixels_per_point(),
+                    os_scale_factor()
+                ),
+            );
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(60));
     }
 }
 
 fn main() -> eframe::Result {
+    force_dpi_awareness();
     install_embedded_wintun();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1954,4 +1969,42 @@ fn main() -> eframe::Result {
         opts,
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
+}
+
+// Если процесс запустился без DPI-awareness (например, из планировщика/WMI),
+// winit получает scale 1.0 и egui раскладывает UI в физических пикселях —
+// интерфейс обрезается справа/снизу. Форсим Per-Monitor V2 до создания окна.
+// Если контекст уже задан — вызов безопасно отказывается.
+#[cfg(windows)]
+fn force_dpi_awareness() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+    }
+    const DPI_AWARE_PER_MONITOR_V2: isize = -4;
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARE_PER_MONITOR_V2);
+    }
+}
+
+#[cfg(not(windows))]
+fn force_dpi_awareness() {}
+
+#[cfg(windows)]
+fn os_scale_factor() -> f32 {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetDpiForSystem() -> u32;
+    }
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f32 / 96.0
+    }
+}
+
+#[cfg(not(windows))]
+fn os_scale_factor() -> f32 {
+    1.0
 }
