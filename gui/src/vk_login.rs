@@ -27,7 +27,7 @@ mod imp {
     // UpdateWindow в windows-rs живёт в Gdi; сама фича Gdi нужна и для WNDCLASSW
     // (поле hbrBackground: HBRUSH гейтит его cfg-ом).
     use windows::Win32::Graphics::Gdi::UpdateWindow;
-    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -43,8 +43,18 @@ mod imp {
     /// порождает NavigationStarting, поэтому нужен и опрос по таймеру.
     unsafe fn check_url(st: &State, hwnd: HWND) -> bool {
         let Some(wv) = st.webview.get() else { return false };
-        let Ok(url) = wv.Url() else { return false };
-        let url = url.to_string();
+        let mut pw = PWSTR::null();
+        if wv.Source(&mut pw).is_err() || pw.is_null() {
+            return false;
+        }
+        let url = match pw.to_string() {
+            Ok(u) => u,
+            Err(_) => {
+                CoTaskMemFree(Some(pw.as_ptr() as *const core::ffi::c_void));
+                return false;
+            }
+        };
+        CoTaskMemFree(Some(pw.as_ptr() as *const core::ffi::c_void));
         let msg = if let Some(tok) = extract_token(&url) {
             Ok(tok)
         } else if url.starts_with("https://oauth.vk") && url.contains("error=") {
