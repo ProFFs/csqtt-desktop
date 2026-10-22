@@ -5,3 +5,8 @@ Cargo.lock.orig
 .idea/
 .vscode/
 .DS_Store
+
+# egui_kittest snapshot temp files
+gui/tests/snapshots/*.new.png
+gui/tests/snapshots/*.diff.png
+gui/tests/snapshots/*.old.png

@@ -13,7 +13,7 @@ jobs:
           rustup toolchain install 1.97.1 --profile minimal
           rustup default 1.97.1
       - name: UI-тесты (egui_kittest, headless)
-        run: cargo test -p csqtt-desktop
+        run: cargo test -p csqtt-desktop -- --test-threads=1
       - name: Build release
         run: cargo build --release -p csqtt-desktop
       - name: Verify embedded wintun

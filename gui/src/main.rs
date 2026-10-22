@@ -2272,11 +2272,13 @@ fn force_dpi_awareness() {}
 #[cfg(test)]
 mod ui_tests {
     use super::*;
-    use egui_kittest::kittest::Queryable;
+    use accesskit::{Role, Toggled};
+    use egui_kittest::kittest::{Key, Node, Queryable};
     use egui_kittest::Harness;
 
     fn harness<'a>() -> Harness<'a, App> {
         theme::install(true);
+        isolate_data_dir();
         Harness::builder()
             .with_size(Vec2::new(560.0, 900.0))
             // фоновый request_repaint_after(60ms) в update() иначе бесконечно
@@ -2287,6 +2289,77 @@ mod ui_tests {
 
     fn settings<'a, 'b>(h: &'b Harness<'a, App>) -> &'b Settings {
         h.state().store.settings.as_ref().unwrap()
+    }
+
+    /// Тесты не трогают реальный ~/.local/share/csqtt-desktop: config.json и
+    /// vk_token лежат во временном каталоге и затираются перед каждым тестом
+    /// (запуск строго `--test-threads=1`, переменные среды — на весь процесс).
+    fn isolate_data_dir() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join("csqtt-desktop-tests");
+            std::fs::create_dir_all(&dir).ok();
+            #[cfg(not(windows))]
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", &dir);
+            }
+            #[cfg(windows)]
+            unsafe {
+                std::env::set_var("APPDATA", &dir);
+            }
+        });
+        std::fs::remove_file(app_dir().join("config.json")).ok();
+        std::fs::remove_file(token_path()).ok();
+    }
+
+    /// Снапшоты пиксель-в-пиксель сверяем только на Linux (генерация:
+    /// `UPDATE_SNAPSHOTS=1 cargo test -p csqtt-desktop -- --test-threads=1`).
+    fn snap(h: &mut Harness<'_, App>, name: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            let img = h.render().expect("headless-рендер (wgpu)");
+            egui_kittest::image_snapshot(&img, name);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (h, name);
+    }
+
+    /// Клик по первому узлу дерева доступности, подходящему под предикат.
+    fn click_where(h: &mut Harness<'_, App>, pred: impl Fn(&Node<'_>) -> bool) {
+        h.query_all_by(|n| pred(n))
+            .next()
+            .expect("matching a11y node not found")
+            .click();
+    }
+
+    /// Настоящий (мышью) клик по единственному узлу заданной высоты —
+    /// нужен для кастомных виджетов, читающих позицию курсора (ползунок).
+    fn simulate_click_by_height(h: &mut Harness<'_, App>, height: f64) {
+        h.query_all_by(|n| {
+            n.raw_bounds()
+                .is_some_and(|b| (b.y1 - b.y0 - height).abs() < 0.5)
+        })
+        .next()
+        .expect("matching a11y node not found")
+        .simulate_click();
+    }
+
+    /// Поля ввода редактора профиля сверху вниз: имя, IP, порт, пароль.
+    fn editor_fields<'a>(h: &'a Harness<'a, App>) -> Vec<Node<'a>> {
+        let mut v: Vec<Node<'_>> = h
+            .query_all_by(|n| matches!(n.role(), Role::TextInput))
+            .collect();
+        v.sort_by(|a, b| {
+            let (ra, rb) = (a.raw_bounds().unwrap(), b.raw_bounds().unwrap());
+            (ra.y0, ra.x0).partial_cmp(&(rb.y0, rb.x0)).unwrap()
+        });
+        v
+    }
+
+    /// Число открытых окон egui (редактор, алерт, справка) — у label-текста
+    /// узлов доступности нет, поэтому окна считаем по Role::Window.
+    fn open_windows(h: &Harness<'_, App>) -> usize {
+        h.query_all_by(|n| matches!(n.role(), Role::Window)).count()
     }
 
     #[test]
@@ -2382,5 +2455,259 @@ mod ui_tests {
             .query_all_by(|n| n.label().is_some_and(|l| l == "i"))
             .count();
         assert!(dots >= 5, "info dots: {dots}");
+    }
+
+    // ─────────────────────── навигация и снапшоты ───────────────────────
+
+    #[test]
+    fn all_pages_snapshots() {
+        let mut h = harness();
+        h.run_steps(2);
+        snap(&mut h, "connect");
+        h.get_by_label("Логи").click();
+        h.run_steps(2);
+        assert_eq!(h.state().page, Page::Logs);
+        snap(&mut h, "logs_empty");
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        assert_eq!(h.state().page, Page::Settings);
+        snap(&mut h, "settings");
+        h.get_by_label_contains("Расширенные").click();
+        h.run_steps(6);
+        snap(&mut h, "settings_advanced");
+        h.get_by_label("Инфо").click();
+        h.run_steps(2);
+        assert_eq!(h.state().page, Page::Info);
+        snap(&mut h, "info");
+    }
+
+    // ─────────────────────── профиль: редактор ───────────────────────
+
+    #[test]
+    fn profile_editor_add_edit_delete() {
+        let mut h = harness();
+        h.run_steps(2);
+        // «Изменить» открывает редактор активного профиля
+        h.get_by_label("Изменить").click();
+        h.run_steps(6);
+        assert_eq!(h.state().editor, Some(1));
+        assert_eq!(open_windows(&h), 1);
+        // Ввод в пустые поля: IP, порт, пароль
+        {
+            let f = editor_fields(&h);
+            assert_eq!(f.len(), 4, "редактор: 4 поля ввода");
+            f[1].type_text("example.org");
+            f[2].type_text("443");
+            f[3].type_text("s3cret");
+        }
+        h.run_steps(2);
+        {
+            let p = &h.state().store.profiles[0];
+            assert_eq!(p.ip, "example.org");
+            assert_eq!(p.port, "443");
+            assert_eq!(p.password, "s3cret");
+        }
+        // Переименование: выделить всё и заменить
+        {
+            let f = editor_fields(&h);
+            f[0].focus();
+            f[0].key_combination(&[Key::Command, Key::A]);
+            f[0].type_text("Основной 2");
+        }
+        h.run_steps(2);
+        assert_eq!(h.state().store.profiles[0].name, "Основной 2");
+        // Ползунок мощности: клик в центр дорожки → 5 групп по 9 = 45
+        simulate_click_by_height(&mut h, 28.0);
+        h.run_steps(2);
+        assert_eq!(h.state().store.profiles[0].power, 45);
+        snap(&mut h, "editor");
+        // «Готово» — закрыть и сохранить
+        h.get_by_label("Готово").click();
+        h.run_steps(2);
+        assert_eq!(h.state().editor, None);
+        assert!(app_dir().join("config.json").exists());
+        // «Удалить» — профиль и активный указатель исчезают
+        h.get_by_label("Изменить").click();
+        h.run_steps(6);
+        h.get_by_label("Удалить").click();
+        h.run_steps(2);
+        assert!(h.state().store.profiles.is_empty());
+        assert_eq!(h.state().store.active_profile_id, None);
+        assert_eq!(h.state().editor, None);
+        assert!(h.query_by_label("нет профиля").is_some());
+        // «+» создаёт новый профиль и сразу открывает его редактор
+        h.get_by_label("+").click();
+        h.run_steps(6);
+        assert_eq!(h.state().store.profiles.len(), 1);
+        assert_eq!(h.state().store.profiles[0].name, "Профиль 2");
+        assert_eq!(h.state().editor, Some(2));
+        h.get_by_label("Готово").click();
+        h.run_steps(2);
+        assert_eq!(h.state().editor, None);
+    }
+
+    // ─────────────────────── профиль: поповер выбора ───────────────────────
+
+    #[test]
+    fn profile_picker_opens_and_selects() {
+        let mut h = harness();
+        h.run_steps(2);
+        // Второй профиль — сразу в store (без UI), чтобы в поповере был выбор
+        h.state_mut().store.profiles.push(Profile {
+            id: 2,
+            name: "Второй".into(),
+            ..Profile::default()
+        });
+        h.run_steps(2);
+        // Кнопка активного профиля открывает поповер
+        click_where(&mut h, |n| n.label().is_some_and(|l| l == "Основной"));
+        h.run_steps(2);
+        assert!(h.state().picker_open);
+        snap(&mut h, "picker");
+        // Выбор «Второй» в поповере: элемент поповера — selectable_label с
+        // toggled=False; жмём настоящей мышью (a11y-Action не закрывает popup)
+        h.query_all_by(|n| {
+            n.label().is_some_and(|l| l == "Второй") && n.toggled() == Some(Toggled::False)
+        })
+        .next()
+        .expect("пункт поповера «Второй»")
+        .simulate_click();
+        h.run_steps(2);
+        assert_eq!(h.state().store.active_profile_id, Some(2));
+        assert!(!h.state().picker_open);
+        // Кнопка показывает новый профиль
+        assert!(h.query_by_label("Второй").is_some());
+    }
+
+    // ─────────────────────── кнопка подключения ───────────────────────
+
+    #[test]
+    fn connect_requires_ip_and_password() {
+        let mut h = harness();
+        h.run_steps(2);
+        // Круг подключения — кастомный виджет 176x176 с Sense::click
+        let circle = |n: &Node<'_>| {
+            n.raw_bounds()
+                .is_some_and(|b| (b.x1 - b.x0 - 176.0).abs() < 1.0 && (b.y1 - b.y0 - 176.0).abs() < 1.0)
+        };
+        click_where(&mut h, circle);
+        h.run_steps(6);
+        let alert = h.state().alert.clone().expect("алерт про IP");
+        assert!(alert.contains("IP"), "{alert}");
+        assert_eq!(open_windows(&h), 1);
+        snap(&mut h, "alert");
+        h.get_by_label("ОК").click();
+        h.run_steps(2);
+        assert!(h.state().alert.is_none());
+        // IP/порт есть, пароля нет → алерт про пароль (соединение не стартует)
+        h.state_mut().store.profiles[0].ip = "example.org".into();
+        h.state_mut().store.profiles[0].port = "443".into();
+        click_where(&mut h, circle);
+        h.run_steps(6);
+        let alert = h.state().alert.clone().expect("алерт про пароль");
+        assert!(alert.contains("пароль"), "{alert}");
+        h.get_by_label("ОК").click();
+        h.run_steps(2);
+        assert!(h.state().alert.is_none());
+    }
+
+    // ─────────────────────── логи и капча ───────────────────────
+
+    #[test]
+    fn logs_copy_clear_and_captcha_field_hidden() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Логи").click();
+        h.run_steps(2);
+        // Активной капчи нет → поля ответа и кнопки «Отправить» нет
+        assert!(!csqtt_core::captcha_active());
+        assert!(h.query_by_label("Отправить").is_none());
+        h.state_mut().logs.extend([
+            "[ОШИБКА] туннель упал".to_string(),
+            "обычная строка".to_string(),
+        ]);
+        h.run_steps(2);
+        snap(&mut h, "logs");
+        h.get_by_label("Копировать").click();
+        h.run_steps(1);
+        assert_eq!(
+            h.output().platform_output.copied_text,
+            "[ОШИБКА] туннель упал\nобычная строка"
+        );
+        h.get_by_label("Очистить").click();
+        h.run_steps(2);
+        assert!(h.state().logs.is_empty());
+    }
+
+    // ─────────────────────── настройки: сегменты и ВК-токен ───────────────────────
+
+    #[test]
+    fn settings_segments_and_vk_token_reset() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        // Режим работы
+        h.get_by_label("Звонки").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).work_mode, "Звонки");
+        // Хеши: «Ручной» показывает поле хешей, «Авто API» скрывает
+        h.get_by_label("Ручной").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).hashes, "Ручной");
+        assert!(h
+            .query_all_by(|n| matches!(n.role(), Role::MultilineTextInput))
+            .next()
+            .is_some());
+        h.get_by_label("Авто API").click();
+        h.run_steps(2);
+        assert_eq!(settings(&h).hashes, "Авто API");
+        // «Авто ВК» есть в обеих строках — берём верхнюю (режим работы);
+        // он же переключает и хеши в «Авто ВК»
+        {
+            let mut v: Vec<_> = h
+                .query_all_by(|n| n.label().is_some_and(|l| l == "Авто ВК"))
+                .collect();
+            v.sort_by_key(|n| n.raw_bounds().map(|b| b.y0 as i64).unwrap_or(0));
+            assert_eq!(v.len(), 2);
+            v[0].click();
+        }
+        h.run_steps(2);
+        assert_eq!(settings(&h).work_mode, "Авто ВК");
+        assert_eq!(settings(&h).hashes, "Авто ВК");
+        // ВК-токен: без него — «Логин», с ним — чип «Сброс ВК»
+        assert!(read_vk_token().is_none());
+        assert!(h.query_by_label("Логин").is_some());
+        assert!(h.query_by_label("Сброс ВК").is_none());
+        assert!(save_vk_token("testtoken123"));
+        h.run_steps(2);
+        assert!(h.query_by_label("Сброс ВК").is_some());
+        snap(&mut h, "settings_token");
+        h.get_by_label("Сброс ВК").click();
+        h.run_steps(2);
+        assert!(read_vk_token().is_none());
+        assert!(h.query_by_label("Логин").is_some());
+    }
+
+    // ─────────────────────── окно справки (ⓘ) ───────────────────────
+
+    #[test]
+    fn help_window_opens_and_closes() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        h.get_by_label_contains("Расширенные").click();
+        h.run_steps(2);
+        assert_eq!(open_windows(&h), 0);
+        // Первая ⓘ (TURN) открывает окно «Справка»…
+        click_where(&mut h, |n| n.label().is_some_and(|l| l == "i"));
+        h.run_steps(20);
+        assert_eq!(open_windows(&h), 1);
+        snap(&mut h, "help");
+        // …та же ⓘ закрывает его
+        click_where(&mut h, |n| n.label().is_some_and(|l| l == "i"));
+        h.run_steps(20);
+        assert_eq!(open_windows(&h), 0);
     }
 }

@@ -27,4 +27,5 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-egui_kittest = { version = "0.31", features = ["eframe"] }
+egui_kittest = { version = "0.31", features = ["eframe", "snapshot", "wgpu"] }
+accesskit = "0.17"
