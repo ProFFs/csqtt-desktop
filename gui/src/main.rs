@@ -1048,6 +1048,16 @@ struct App {
     /// Момент сворачивания в трей — автозакрытие тоста через ~3.5 с.
     #[cfg(windows)]
     toast_at: Option<Instant>,
+    /// Клон первого пункта меню трея («Потоки: …») — muda MenuItem Clone;
+    /// текст обновляется из tray_tick по self.stats.
+    #[cfg(windows)]
+    tray_stats_item: Option<tray_icon::menu::MenuItem>,
+    /// Момент последней записи статистики в меню трея (троттлинг ~1 с).
+    #[cfg(windows)]
+    tray_stats_at: Option<Instant>,
+    /// Статистика, уже записанная в пункт меню трея (чтобы не дёргать set_text).
+    #[cfg(windows)]
+    tray_stats_written: (usize, u64, u64),
 }
 
 impl App {
@@ -1091,6 +1101,12 @@ impl App {
             quitting: false,
             #[cfg(windows)]
             toast_at: None,
+            #[cfg(windows)]
+            tray_stats_item: None,
+            #[cfg(windows)]
+            tray_stats_at: None,
+            #[cfg(windows)]
+            tray_stats_written: (0, 0, 0),
         }
     }
 
@@ -1446,20 +1462,26 @@ impl App {
         }
         use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
         let menu = Menu::new();
+        let mi_stats = MenuItem::with_id("tray_stats", "Потоки: — · ↑ — · ↓ —", false, None);
         let mi_conn = MenuItem::with_id("tray_connect", "Подключиться", true, None);
         let mi_disc = MenuItem::with_id("tray_disconnect", "Отключиться", true, None);
         let sep = PredefinedMenuItem::separator();
         let mi_quit = MenuItem::with_id("tray_quit", "Выйти", true, None);
         if menu
-            .append_items(&[&mi_conn, &mi_disc, &sep, &mi_quit])
+            .append_items(&[&mi_stats, &mi_conn, &mi_disc, &sep, &mi_quit])
             .is_err()
         {
             push_log("[ТРЕЙ] Не удалось собрать меню трея".into());
             return;
         }
+        self.tray_stats_item = Some(mi_stats.clone());
+        self.tray_stats_at = None;
+        self.tray_stats_written = (0, 0, 0);
         let mut b = tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("CSQTT");
+            // Тултип — ровно «csqtt-desktop», выставляется один раз здесь;
+            // больше нигде не меняется (set_tooltip в других местах удалён).
+            .with_tooltip("csqtt-desktop");
         match tray_icon::Icon::from_rgba(
             include_bytes!("../assets/tray_icon.bin").to_vec(),
             32,
@@ -1474,23 +1496,55 @@ impl App {
         }
     }
 
-    /// Перехват закрытия окна: отменить, свернуть в трей, показать тост.
+    /// Перехват закрытия окна: отменить, «спрятать» в трей, уведомить.
+    ///
+    /// ВАЖНО: вместо ViewportCommand::Visible(false) окно уносится за пределы
+    /// экрана минимальным размером («off-screen hide»). Visible(false) делает
+    /// окно невидимым для Windows → перестают приходить redraw-события →
+    /// eframe не вызывает update() → tray_tick зависает («Выйти» и клик по
+    /// иконке перестают работать). Off-screen окно остаётся «видимым» для
+    /// ОС, и цикл репейнта живёт.
     #[cfg(windows)]
     fn tray_on_close(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         self.make_tray();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            32000.0, 32000.0,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
         self.tray_hidden = true;
         self.toast_at = Some(Instant::now());
-        if let Some(t) = &self.tray {
-            let _ = t.set_tooltip(Some("CSQTT в трее"));
-        }
+        // Нативное уведомление Windows (ошибки игнорируем — egui-тост ниже
+        // остаётся фолбэком, теперь он реально отрисуется: цикл жив).
+        let _ = notify_rust::Notification::new()
+            .app_name("csqtt-desktop")
+            .summary("csqtt-desktop")
+            .body("Приложение свёрнуто в трей — иконка рядом с часами")
+            .show();
         push_log("[ТРЕЙ] Приложение свёрнуто в трей".into());
     }
 
-    /// Опрос событий меню/иконки трея + тост-уведомление. Вызывается из update().
+    /// Опрос событий меню/иконки трея + обновление статистики + тост. Вызывается из update().
     #[cfg(windows)]
     fn tray_tick(&mut self, ctx: &egui::Context) {
+        // Статистика первым пунктом меню: не чаще раза в секунду и только при
+        // изменении self.stats (клон MenuItem живёт в поле App).
+        if let Some(mi) = &self.tray_stats_item {
+            let changed = self.stats != self.tray_stats_written;
+            let due = self
+                .tray_stats_at
+                .map_or(true, |t| t.elapsed().as_secs_f32() >= 1.0);
+            if changed && due {
+                mi.set_text(format!(
+                    "Потоки: {} · ↑ {} · ↓ {}",
+                    self.stats.0,
+                    fmt_bytes(self.stats.1),
+                    fmt_bytes(self.stats.2)
+                ));
+                self.tray_stats_written = self.stats;
+                self.tray_stats_at = Some(Instant::now());
+            }
+        }
         // меню трея
         while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             match ev.id.0.as_str() {
@@ -1530,11 +1584,12 @@ impl App {
             };
             if restore && self.tray_hidden {
                 self.tray_hidden = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                // Возврат из «off-screen hide»: размер по умолчанию 560×880,
+                // центр экрана, фокус. Visible(true) не нужен — окно и так
+                // было видимым для Windows.
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 880.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Center);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                if let Some(t) = &self.tray {
-                    let _ = t.set_tooltip(Some("CSQTT"));
-                }
                 ctx.request_repaint();
             }
         }

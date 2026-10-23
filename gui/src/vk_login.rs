@@ -21,7 +21,7 @@ mod imp {
     use webview2_com::{
         CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
         ExecuteScriptCompletedHandler, NavigationStartingEventHandler,
-        NewWindowRequestedEventHandler,
+        NewWindowRequestedEventHandler, SourceChangedEventHandler,
     };
     use windows::core::{w, Error, HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -47,9 +47,9 @@ mod imp {
 
     /// VK на странице «Пожалуйста, не передавайте эту ссылку или токен никому»
     /// вычищает #access_token из адресной строки через history.replaceState,
-    /// поэтому одного Source() мало: читаем токен и из текста страницы.
-    const TOKEN_SCRIPT: &str = "(function(){try{var t=(document.body&&document.body.innerText)||'';\
-        var m=t.match(/access_token=([0-9a-zA-Z_\\-\\.]+)/);return m?m[1]:'';}catch(e){return '';}})()";
+    /// поэтому одного Source() мало: ищем токен в innerHTML страницы И в value
+    /// полей input/textarea (innerText не видит значение <input>).
+    const TOKEN_SCRIPT: &str = "(function(){try{var d=document,s=(d.body&&d.body.innerHTML)||'',m=s.match(/access_token=([0-9a-zA-Z_\\-\\.]+)/);if(m)return m[1];var e=d.querySelectorAll('input,textarea');for(var i=0;i<e.length;i++){var v=e[i].value||'';var m2=v.match(/access_token=([0-9a-zA-Z_\\-\\.]+)/);if(m2)return m2[1];}return '';}catch(x){return '';}})()";
 
     /// Проверка текущего URL: токен/ошибка -> канал + закрытие окна.
     /// VK приходит на blank.html#access_token=... — фрагмент не всегда
@@ -298,6 +298,69 @@ mod imp {
             }));
             let mut token2 = 0i64;
             let _ = webview.add_NewWindowRequested(&nw, &mut token2);
+
+            // SourceChanged срабатывает и на fragment-навигациях, и на
+            // history.replaceState: при ПЕРВОМ входе VK уходит на
+            // blank.html#access_token=..., а его JS тут же стирает фрагмент —
+            // NavigationStarting такую навигацию не видит, а SourceChanged — да,
+            // URL с токеном ловится ДО зачистки.
+            let tx_sc = tx.clone();
+            let sc = SourceChangedEventHandler::create(Box::new(move |sender, _args| {
+                if let Some(wv) = sender {
+                    let mut pw = PWSTR::null();
+                    if wv.Source(&mut pw).is_ok() && !pw.is_null() {
+                        let url = pw.to_string().unwrap_or_default();
+                        CoTaskMemFree(Some(pw.as_ptr() as *const core::ffi::c_void));
+                        let msg = if let Some(tok) = extract_token(&url) {
+                            Some(Ok(tok))
+                        } else if url.starts_with("https://oauth.vk") && url.contains("error=") {
+                            Some(Err("VK вернул ошибку авторизации".to_string()))
+                        } else {
+                            None
+                        };
+                        if let Some(msg) = msg {
+                            if !state.captured.swap(true, Ordering::SeqCst) {
+                                let _ = tx_sc.send(msg);
+                            }
+                            close_window(hwnd);
+                        }
+                    }
+                }
+                Ok(())
+            }));
+            let mut token3 = 0i64;
+            let _ = webview.add_SourceChanged(&sc, &mut token3);
+
+            // Вход во iframe: навигации фреймов проверяем так же. На
+            // ICoreWebView2::add_FrameNavigationStarting принимает обычный
+            // NavigationStartingEventHandler (проверено по webview2-com-sys
+            // 0.39.1: ICoreWebView2FrameNavigationStartingArgs наследует
+            // ICoreWebView2NavigationStartingEventArgs, Uri — тот же метод).
+            let tx_fn = tx.clone();
+            let fnh = NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
+                if let Some(args) = args {
+                    let mut uri = PWSTR::null();
+                    if args.Uri(&mut uri).is_ok() {
+                        if let Ok(uri) = uri.to_string() {
+                            if let Some(tok) = extract_token(&uri) {
+                                if !state.captured.swap(true, Ordering::SeqCst) {
+                                    let _ = tx_fn.send(Ok(tok));
+                                }
+                                close_window(hwnd);
+                            } else if uri.contains("error=") {
+                                if !state.captured.swap(true, Ordering::SeqCst) {
+                                    let _ =
+                                        tx_fn.send(Err("VK вернул ошибку авторизации".to_string()));
+                                }
+                                close_window(hwnd);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }));
+            let mut token4 = 0i64;
+            let _ = webview.add_FrameNavigationStarting(&fnh, &mut token4);
 
             let nav_url = HSTRING::from(url);
             let _ = webview.Navigate(&nav_url);
