@@ -273,7 +273,7 @@ fn save_vk_token(raw: &str) -> bool {
         let _ = std::fs::set_permissions(token_path(), std::fs::Permissions::from_mode(0o600));
     }
     if res.is_ok() {
-        push_log("[ВК] Токен сохранён".into());
+        push_log("[ВК] Токен применён".into());
     }
     res.is_ok()
 }
@@ -479,6 +479,40 @@ fn install_embedded_wintun() {
 
 #[cfg(not(windows))]
 fn install_embedded_wintun() {}
+
+/// True, если процесс запущен с повышенными правами (UAC-элевация).
+/// На не-Windows — всегда true (проверка не нужна).
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, OpenProcessToken, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(std::ptr::addr_of_mut!(elev).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elev.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn is_elevated() -> bool {
+    true
+}
 
 
 // ───────────────────────────── виджеты csqtt ─────────────────────────────
@@ -907,15 +941,15 @@ fn nav_bar(ui: &mut egui::Ui, page: Page) -> Option<Page> {
     goto
 }
 
-/// TunnelWorkersSlider: dots + knob (csqtt workers slider).
-/// Перетаскивание плавное: knob под курсором, значение квантуется группами по 9.
+/// TunnelWorkersSlider: непрерывный ползунок 1..=max (шаг 1) + knob.
+/// Перетаскивание плавное: значение = round по дорожке, без квантования группами.
 fn power_dots(ui: &mut egui::Ui, power: &mut usize, max: usize, on_change: &mut dyn FnMut()) {
-    let groups = (max / WORKERS_PER_GROUP).max(2);
+    let max = max.max(2);
     let before = *power;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Мощность").strong().color(th().ON_SURF).size(14.5));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{power} потоков")).color(th().ON_SURF_VAR).size(12.5));
+            ui.label(RichText::new(format!("потоки: {power}")).color(th().ON_SURF_VAR).size(12.5));
         });
     });
     let (rect, resp) =
@@ -932,14 +966,15 @@ fn power_dots(ui: &mut egui::Ui, power: &mut usize, max: usize, on_change: &mut 
         if let Some(pos) = resp.interact_pointer_pos() {
             let f = ((pos.x - track_l) / track_w).clamp(0.0, 1.0);
             frac_drag = Some(f);
-            let g = ((f * groups as f32).round() as usize).clamp(1, groups);
-            *power = (g * WORKERS_PER_GROUP).min(max);
+            // непрерывно: 1 у левого края, max у правого, шаг 1
+            *power = (1 + (f * (max - 1) as f32).round() as usize).clamp(1, max);
         }
     }
     painter.line_segment(
         [Pos2::new(track_l, cy), Pos2::new(track_l + track_w, cy)],
         Stroke::new(2.0, th().OUTLINE_VAR),
     );
+    let groups = (max / WORKERS_PER_GROUP).max(2);
     for i in 0..groups {
         let gx = track_l + track_w * (i as f32 / (groups - 1) as f32);
         let filled = (i + 1) * WORKERS_PER_GROUP <= *power;
@@ -950,9 +985,8 @@ fn power_dots(ui: &mut egui::Ui, power: &mut usize, max: usize, on_change: &mut 
         );
     }
     let frac = frac_drag.unwrap_or({
-        // knob ровно по точкам-группам: минимум у левого края, максимум у правого
-        let g = (*power / WORKERS_PER_GROUP).clamp(1, groups);
-        (g - 1) as f32 / (groups - 1) as f32
+        // knob непрерывно по значению: минимум у левого края, максимум у правого
+        ((*power).clamp(1, max) - 1) as f32 / (max - 1) as f32
     });
     let kx = track_l + track_w * frac;
     painter.line_segment(
@@ -996,6 +1030,10 @@ struct App {
     connect_error: Option<String>,
     captcha_answer: String,
     connected_at: Option<Instant>,
+    /// момент последней СМЕНЫ ConnState (None до первого перехода) — фаза
+    /// анимации центральной кнопки; при None анимации нет
+    state_anim_at: Option<Instant>,
+    anim_prev_state: ConnState,
     dark: bool,
     vk_rx: Option<Receiver<Result<String, String>>>,
 }
@@ -1031,6 +1069,8 @@ impl App {
             connect_error: None,
             captcha_answer: String::new(),
             connected_at: None,
+            state_anim_at: None,
+            anim_prev_state: ConnState::Disconnected,
             dark,
             vk_rx: None,
         }
@@ -1094,11 +1134,15 @@ impl App {
                         }
                     }
                     "READY" => self.state = ConnState::Connected,
-                    "STOPPED" => self.state = ConnState::Disconnected,
+                    "STOPPED" => {
+                        self.state = ConnState::Disconnected;
+                        self.stats = (0, 0, 0);
+                    }
                     "ACTIVE_ZERO" => self.logs.push_back("· нет активных туннелей".into()),
                     "TUN_LOST" => {
                         self.logs.push_back("[ТЮН] канал потерян".into());
                         self.state = ConnState::Disconnected;
+                        self.stats = (0, 0, 0);
                     }
                     "ERROR" => {
                         let msg = serde_json::from_str::<serde_json::Value>(payload)
@@ -1110,19 +1154,42 @@ impl App {
                         self.logs.push_back(format!("[ОШИБКА] {msg}"));
                         self.connect_error = Some(msg);
                         self.state = ConnState::Disconnected;
+                        self.stats = (0, 0, 0);
                     }
                     _ => {}
                 }
             } else {
-                if self.logs.len() >= 3000 {
-                    self.logs.pop_front();
+                // «[СТАТИСТИКА]» — живая строка: не плодим новые, а обновляем
+                // последнюю, если она тоже статистическая (трафик на месте).
+                let replaced = line.starts_with("[СТАТИСТИКА]")
+                    && self
+                        .logs
+                        .back_mut()
+                        .is_some_and(|last| {
+                            if last.starts_with("[СТАТИСТИКА]") {
+                                *last = line.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                if !replaced {
+                    if self.logs.len() >= 3000 {
+                        self.logs.pop_front();
+                    }
+                    self.logs.push_back(line);
                 }
-                self.logs.push_back(line);
             }
         }
         while let Ok(ev) = self.ui_rx.try_recv() {
             match ev {
-                UiEvent::State(s) => self.state = s,
+                UiEvent::State(s) => {
+                    self.state = s;
+                    // после отключения статистика под кнопкой обнуляется
+                    if s == ConnState::Disconnected {
+                        self.stats = (0, 0, 0);
+                    }
+                }
                 UiEvent::Alert(msg) => self.alert = Some(msg),
                 UiEvent::PasteTokenOpen => self.paste_open = true,
                 UiEvent::PasteTokenSaved => {
@@ -1142,8 +1209,8 @@ impl App {
             let (tx, rx) = mpsc::channel();
             vk_login::start(VK_AUTH_URL.to_string(), tx);
             self.vk_rx = Some(rx);
-            self.alert =
-                Some("Окошко входа открыто — войди в нём, токен подставится сам.".into());
+            // без попапов: только строка в лог
+            push_log("[ВК] Открываю окошко входа…".into());
         }
         #[cfg(not(windows))]
         {
@@ -1153,6 +1220,13 @@ impl App {
     }
 
     fn start(&mut self) {
+        if !is_elevated() {
+            self.alert = Some(
+                "Нужен запуск от администратора: закрой программу, нажми правой кнопкой на csqtt-desktop.exe \u{2192} \u{ab}Запуск от имени администратора\u{bb}".into(),
+            );
+            push_log("[СТАРТ] нет прав администратора".into());
+            return;
+        }
         let Some(profile) = self.active_profile() else {
             push_log("[СТАРТ] нет профиля — добавьте его кнопкой «+ Добавить»".into());
             self.alert = Some("Нет профиля — добавьте его кнопкой «+ Добавить»".into());
@@ -1221,7 +1295,7 @@ impl App {
         let obfs = if s.masking == "Средняя" { "unified" } else { "audio" };
         let peer = format!("{}:{}", profile.ip.trim(), profile.port.trim());
         let password = profile.password.trim().to_string();
-        let workers = profile.power.max(WORKERS_PER_GROUP);
+        let workers = profile.power.max(1);
         let vk_token_for_core = token.clone();
         let auto_api = hash_mode == "auto_api";
         let hash_mode_owned = hash_mode.to_string();
@@ -1363,61 +1437,100 @@ impl App {
             ConnState::Disconnected => ("Отключено", th().ON_SURF_VAR),
         };
 
-        // центральная карточка подключения
+        // центральная кнопка подключения — без карточки, прямо на фоне экрана
         let mut toggle = false;
-        cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                let (c_rect, resp) = ui.allocate_exact_size(Vec2::splat(176.0), Sense::click());
-                let c = c_rect.center();
-                let p = ui.painter();
-                let r = 84.0f32 * if active { 1.06 } else { 0.96 };
-                if active {
-                    p.circle_filled(c, r + 12.0, th().PRIMARY.linear_multiply(0.10));
-                }
-                p.circle_filled(c, r, if active { th().PRIMARY } else { th().SURF_VAR });
-                let ring = match self.state {
-                    ConnState::Connected | ConnState::Connecting => th().PRIMARY,
-                    ConnState::Disconnecting => th().TERTIARY,
-                    ConnState::Disconnected => th().OUTLINE_VAR,
-                };
-                p.circle_stroke(c, r, Stroke::new(2.0, ring));
-                let gc = c + Vec2::new(0.0, 4.0);
-                let gr = r * 0.32;
-                let gcol = if active { th().ON_PRIMARY } else { th().ON_SURF_VAR.linear_multiply(0.55) };
-                power_glyph(p, gc, gr, Stroke::new(3.0, gcol));
-                if resp.clicked() {
-                    toggle = true;
-                }
-                ui.add_space(14.0);
-                ui.label(RichText::new(status.0).strong().color(status.1).size(14.5));
-                let up = self
-                    .connected_at
-                    .map(|t| format_uptime(t.elapsed().as_secs()))
-                    .unwrap_or_else(|| "00:00:00".into());
-                ui.label(
-                    RichText::new(up)
-                        .strong()
-                        .color(if matches!(self.state, ConnState::Connected) {
-                            th().PRIMARY
-                        } else {
-                            th().ON_SURF_VAR.linear_multiply(0.7)
-                        })
-                        .size(14.0),
-                );
-                if self.stats.0 > 0 {
-                    ui.label(
-                        RichText::new(format!(
-                            "туннели: {} · ↑ {} · ↓ {}",
-                            self.stats.0,
+        ui.vertical_centered(|ui| {
+            let (c_rect, resp) = ui.allocate_exact_size(Vec2::splat(176.0), Sense::click());
+            let c = c_rect.center();
+            let p = ui.painter();
+            // анимация: «дыхание» при переходе + финальный импульс-кольцо
+            // (elapsed огромен до первой смены состояния — анимации нет)
+            let elapsed = self
+                .state_anim_at
+                .map(|t| t.elapsed().as_secs_f32())
+                .unwrap_or(f32::MAX);
+            let breathing =
+                matches!(self.state, ConnState::Connecting | ConnState::Disconnecting);
+            let impulse = matches!(self.state, ConnState::Connected | ConnState::Disconnected)
+                && elapsed < 0.6;
+            let base_r = 84.0f32 * if active { 1.06 } else { 0.96 };
+            let r = if breathing {
+                base_r * (1.0 + 0.03 * (elapsed * std::f32::consts::TAU * 1.2).sin())
+            } else {
+                base_r
+            };
+            if active {
+                p.circle_filled(c, r + 12.0, th().PRIMARY.linear_multiply(0.10));
+            }
+            p.circle_filled(c, r, if active { th().PRIMARY } else { th().SURF_VAR });
+            let ring = match self.state {
+                ConnState::Connected | ConnState::Connecting => th().PRIMARY,
+                ConnState::Disconnecting => th().TERTIARY,
+                ConnState::Disconnected => th().OUTLINE_VAR,
+            };
+            p.circle_stroke(c, r, Stroke::new(2.0, ring));
+            if impulse {
+                // расходящееся кольцо: r → r*1.45, прозрачность линейно к 0
+                let t = elapsed / 0.6;
+                let col = if active { th().PRIMARY } else { th().OUTLINE_VAR };
+                p.circle_stroke(c, r * (1.0 + 0.45 * t), Stroke::new(2.5, col.linear_multiply(1.0 - t)));
+            }
+            if breathing || impulse {
+                ui.ctx().request_repaint();
+            }
+            let gc = c + Vec2::new(0.0, 4.0);
+            let gr = r * 0.32;
+            let gcol = if active { th().ON_PRIMARY } else { th().ON_SURF_VAR.linear_multiply(0.55) };
+            power_glyph(p, gc, gr, Stroke::new(3.0, gcol));
+            if resp.clicked() {
+                toggle = true;
+            }
+            ui.add_space(14.0);
+            ui.label(RichText::new(status.0).strong().color(status.1).size(14.5));
+            let up = self
+                .connected_at
+                .map(|t| format_uptime(t.elapsed().as_secs()))
+                .unwrap_or_else(|| "00:00:00".into());
+            ui.label(
+                RichText::new(up)
+                    .strong()
+                    .color(if matches!(self.state, ConnState::Connected) {
+                        th().PRIMARY
+                    } else {
+                        th().ON_SURF_VAR.linear_multiply(0.7)
+                    })
+                    .size(14.0),
+            );
+            // бейдж туннелей: пилюля с числом + мелкая серая подпись
+            if self.stats.0 > 0 || self.state == ConnState::Connected {
+                ui.add_space(2.0);
+                let gal_n = ui.fonts(|f| {
+                    f.layout_no_wrap(self.stats.0.to_string(), FontId::proportional(11.5), th().ON_PRIMARY)
+                });
+                let pw = (gal_n.size().x + 18.0).max(30.0);
+                let ph = 20.0;
+                let gal_s = ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        format!(
+                            "туннели · ↑ {} · ↓ {}",
                             fmt_bytes(self.stats.1),
                             fmt_bytes(self.stats.2)
-                        ))
-                        .color(th().ON_SURF_VAR)
-                        .size(11.5),
-                    );
-                }
-            });
+                        ),
+                        FontId::proportional(11.0),
+                        th().ON_SURF_VAR,
+                    )
+                });
+                let total = pw + 8.0 + gal_s.size().x;
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(total, ph), Sense::hover());
+                let pb = ui.painter();
+                let pill = Rect::from_min_size(rect.min, Vec2::new(pw, ph));
+                let fill = if self.stats.0 > 0 { th().SUCCESS } else { th().ERR };
+                pb.rect_filled(pill, CornerRadius::same(10), fill);
+                pb.galley(pill.center() - gal_n.size() / 2.0, gal_n, Color32::TRANSPARENT);
+                let sub_pos =
+                    Pos2::new(rect.right() - gal_s.size().x, rect.center().y - gal_s.size().y / 2.0);
+                pb.galley(sub_pos, gal_s, Color32::TRANSPARENT);
+            }
         });
         if toggle {
             match self.state {
@@ -1676,28 +1789,18 @@ impl App {
                                 None => r.to_string(),
                             };
                             if parsed.is_empty() {
-                                let _ = ui_tx.send(UiEvent::Alert(
-                                    "Не удалось разобрать токен".into(),
-                                ));
+                                push_log("[ВК] Не удалось разобрать токен".into());
                                 return;
                             }
                             match vk_token_check(&client, &parsed).await {
                                 Some(false) => {
-                                    let _ = ui_tx.send(UiEvent::Alert(
-                                        "Токен не прошёл проверку VK".into(),
-                                    ));
+                                    push_log("[ВК] Токен не прошёл проверку VK".into());
                                 }
                                 _ => {
-                                    if save_vk_token(&parsed) {
-                                        let _ = ui_tx.send(UiEvent::PasteTokenSaved);
-                                        let _ = ui_tx.send(UiEvent::Alert(
-                                            "Токен ВКонтакте сохранён".into(),
-                                        ));
-                                    } else {
-                                        let _ = ui_tx.send(UiEvent::Alert(
-                                            "Не удалось сохранить токен".into(),
-                                        ));
+                                    if !save_vk_token(&parsed) {
+                                        push_log("[ВК] Не удалось сохранить токен".into());
                                     }
+                                    let _ = ui_tx.send(UiEvent::PasteTokenSaved);
                                 }
                             }
                         });
@@ -2056,7 +2159,7 @@ impl App {
             return;
         };
         let s = self.settings();
-        let max_power = if s.extra_threads { 162 } else { 90 };
+        let max_power = if s.extra_threads { 162 } else { 81 };
         let mut deleted = false;
         let mut close = false;
 
@@ -2197,10 +2300,10 @@ impl eframe::App for App {
                     self.rt.spawn(async move {
                         match vk_token_check(&client, &tok).await {
                             Some(false) => {
-                                let _ = ui_tx.send(UiEvent::Alert(
-                                    "Полученный токен не прошёл проверку VK — вставь вручную"
+                                push_log(
+                                    "[ВК] Полученный токен не прошёл проверку VK — вставь вручную"
                                         .into(),
-                                ));
+                                );
                                 let _ = ui_tx.send(UiEvent::PasteTokenOpen);
                             }
                             None => {
@@ -2209,20 +2312,12 @@ impl eframe::App for App {
                                         .into(),
                                 );
                                 if !save_vk_token(&tok) {
-                                    let _ = ui_tx.send(UiEvent::Alert(
-                                        "Не удалось сохранить токен".into(),
-                                    ));
+                                    push_log("[ВК] Не удалось сохранить токен".into());
                                 }
                             }
                             Some(true) => {
-                                if save_vk_token(&tok) {
-                                    let _ = ui_tx.send(UiEvent::Alert(
-                                        "Токен ВКонтакте сохранён".into(),
-                                    ));
-                                } else {
-                                    let _ = ui_tx.send(UiEvent::Alert(
-                                        "Не удалось сохранить токен".into(),
-                                    ));
+                                if !save_vk_token(&tok) {
+                                    push_log("[ВК] Не удалось сохранить токен".into());
                                 }
                             }
                         }
@@ -2231,7 +2326,7 @@ impl eframe::App for App {
                 }
                 Ok(Err(e)) => {
                     self.vk_rx = None;
-                    self.alert = Some(e);
+                    push_log(format!("[ВК] {e}"));
                     self.paste_open = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vk_rx = None,
@@ -2246,6 +2341,10 @@ impl eframe::App for App {
             ctx.memory_mut(|m| m.close_popup());
         }
 
+        if self.state != self.anim_prev_state {
+            self.anim_prev_state = self.state;
+            self.state_anim_at = Some(Instant::now());
+        }
         if self.state == ConnState::Connected {
             if self.connected_at.is_none() {
                 self.connected_at = Some(Instant::now());
@@ -2646,10 +2745,10 @@ mod ui_tests {
         }
         h.run_steps(2);
         assert_eq!(h.state().store.profiles[0].name, "Основной 2");
-        // Ползунок мощности: клик в центр дорожки → 5 групп по 9 = 45
+        // Ползунок мощности: непрерывный 1..=81, клик в центр дорожки → ≈41
         simulate_click_by_height(&mut h, 28.0);
         h.run_steps(2);
-        assert_eq!(h.state().store.profiles[0].power, 45);
+        assert!((40..=42).contains(&h.state().store.profiles[0].power), "power={}", h.state().store.profiles[0].power);
         snap(&mut h, "editor");
         // «Готово» — закрыть и сохранить
         h.get_by_label("Готово").click();

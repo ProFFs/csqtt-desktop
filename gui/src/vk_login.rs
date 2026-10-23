@@ -20,7 +20,8 @@ mod imp {
     use webview2_com::Microsoft::Web::WebView2::Win32::*;
     use webview2_com::{
         CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-        NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+        ExecuteScriptCompletedHandler, NavigationStartingEventHandler,
+        NewWindowRequestedEventHandler,
     };
     use windows::core::{w, Error, HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -37,6 +38,18 @@ mod imp {
         tx: OnceLock<Sender<Result<String, String>>>,
         captured: AtomicBool,
     }
+
+    /// Закрытие окна из колбэков — только через WM_CLOSE (DestroyWindow из
+    /// callback-контекста WebView2 небезопасен).
+    unsafe fn close_window(hwnd: HWND) {
+        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+
+    /// VK на странице «Пожалуйста, не передавайте эту ссылку или токен никому»
+    /// вычищает #access_token из адресной строки через history.replaceState,
+    /// поэтому одного Source() мало: читаем токен и из текста страницы.
+    const TOKEN_SCRIPT: &str = "(function(){try{var t=(document.body&&document.body.innerText)||'';\
+        var m=t.match(/access_token=([0-9a-zA-Z_\\-\\.]+)/);return m?m[1]:'';}catch(e){return '';}})()";
 
     /// Проверка текущего URL: токен/ошибка -> канал + закрытие окна.
     /// VK приходит на blank.html#access_token=... — фрагмент не всегда
@@ -67,7 +80,7 @@ mod imp {
                 let _ = tx.send(msg);
             }
         }
-        let _ = DestroyWindow(hwnd);
+        close_window(hwnd);
         true
     }
 
@@ -102,8 +115,39 @@ mod imp {
                 LRESULT(0)
             }
             WM_TIMER => {
-                if !state.is_null() && unsafe { check_url(&*state, hwnd) } {
-                    return LRESULT(0);
+                if !state.is_null() {
+                    let st = unsafe { &*state };
+                    if unsafe { check_url(st, hwnd) } {
+                        return LRESULT(0);
+                    }
+                    // Фолбэк: VK прячет токен из URL (replaceState) — вытащить
+                    // его из innerText страницы через ExecuteScript. Новый
+                    // handler на каждый тик (раз в 300 мс) — их мало; sender и
+                    // hwnd передаём копями, состояние — по 'static ссылке.
+                    if !st.captured.load(Ordering::SeqCst) {
+                        if let (Some(wv), Some(tx)) = (st.webview.get(), st.tx.get()) {
+                            let tx = tx.clone();
+                            let script = HSTRING::from(TOKEN_SCRIPT);
+                            let handler =
+                                ExecuteScriptCompletedHandler::create(Box::new(
+                                    move |res: windows::core::Result<()>, json: String| {
+                                        // результат ExecuteScript — JSON: строка в кавычках
+                                        if res.is_ok() {
+                                            let tok = json.trim().trim_matches('"').trim().to_string();
+                                            if !tok.is_empty() && !st.captured.swap(true, Ordering::SeqCst)
+                                            {
+                                                let _ = tx.send(Ok(tok));
+                                            }
+                                        }
+                                        if st.captured.load(Ordering::SeqCst) {
+                                            unsafe { close_window(hwnd) };
+                                        }
+                                        Ok(())
+                                    },
+                                ));
+                            let _ = unsafe { wv.ExecuteScript(&script, &handler) };
+                        }
+                    }
                 }
                 LRESULT(0)
             }
@@ -222,11 +266,11 @@ mod imp {
                             if let Some(tok) = extract_token(&uri) {
                                 state.captured.store(true, Ordering::SeqCst);
                                 let _ = tx_nav.send(Ok(tok));
-                                let _ = DestroyWindow(hwnd);
+                                close_window(hwnd);
                             } else if uri.contains("error=") {
                                 state.captured.store(true, Ordering::SeqCst);
                                 let _ = tx_nav.send(Err("VK вернул ошибку авторизации".to_string()));
-                                let _ = DestroyWindow(hwnd);
+                                close_window(hwnd);
                             }
                         }
                     }
