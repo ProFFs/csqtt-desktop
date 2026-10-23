@@ -1037,6 +1037,17 @@ struct App {
     anim_prev_state: ConnState,
     dark: bool,
     vk_rx: Option<Receiver<Result<String, String>>>,
+    /// Иконка системного трея (Windows); создаётся при первом сворачивании.
+    /// Дроп последней ссылки удаляет иконку из трея (tray-icon 0.19).
+    #[cfg(windows)]
+    tray: Option<tray_icon::TrayIcon>,
+    /// Окно скрыто в трей (закрытие отменено), а не закрыто.
+    tray_hidden: bool,
+    /// «Выйти» из меню трея: закрытие больше не перехватываем.
+    quitting: bool,
+    /// Момент сворачивания в трей — автозакрытие тоста через ~3.5 с.
+    #[cfg(windows)]
+    toast_at: Option<Instant>,
 }
 
 impl App {
@@ -1074,6 +1085,12 @@ impl App {
             anim_prev_state: ConnState::Disconnected,
             dark,
             vk_rx: None,
+            #[cfg(windows)]
+            tray: None,
+            tray_hidden: false,
+            quitting: false,
+            #[cfg(windows)]
+            toast_at: None,
         }
     }
 
@@ -1409,6 +1426,159 @@ impl App {
                 handle.spawn(async move {
                     finish_auto_calls(http_client(), token, ids).await;
                 });
+            }
+        }
+    }
+
+    // ─────────────────────────── трей (Windows) ───────────────────────────
+    //
+    // Закрытие окна не выходит из приложения: close-запрос отменяется, окно
+    // скрывается (ViewportCommand::Visible(false)), в трее создаётся иконка с
+    // меню «Подключиться / Отключиться / Выйти» и показывается тост-
+    // уведомление. Двойной клик (или клик ЛКМ) по иконке восстанавливает окно.
+    // События трея опрашиваются в update() — main-поток, как требует tray-icon.
+
+    /// Создать иконку трея с меню. Повторный вызов — no-op.
+    #[cfg(windows)]
+    fn make_tray(&mut self) {
+        if self.tray.is_some() {
+            return;
+        }
+        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+        let menu = Menu::new();
+        let mi_conn = MenuItem::with_id("tray_connect", "Подключиться", true, None);
+        let mi_disc = MenuItem::with_id("tray_disconnect", "Отключиться", true, None);
+        let sep = PredefinedMenuItem::separator();
+        let mi_quit = MenuItem::with_id("tray_quit", "Выйти", true, None);
+        if menu
+            .append_items(&[&mi_conn, &mi_disc, &sep, &mi_quit])
+            .is_err()
+        {
+            push_log("[ТРЕЙ] Не удалось собрать меню трея".into());
+            return;
+        }
+        let mut b = tray_icon::TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("CSQTT");
+        match tray_icon::Icon::from_rgba(
+            include_bytes!("../assets/tray_icon.bin").to_vec(),
+            32,
+            32,
+        ) {
+            Ok(ic) => b = b.with_icon(ic),
+            Err(e) => push_log(format!("[ТРЕЙ] Иконка не принята: {e}")),
+        }
+        match b.build() {
+            Ok(t) => self.tray = Some(t),
+            Err(e) => push_log(format!("[ТРЕЙ] Иконка не создана: {e}")),
+        }
+    }
+
+    /// Перехват закрытия окна: отменить, свернуть в трей, показать тост.
+    #[cfg(windows)]
+    fn tray_on_close(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.make_tray();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.tray_hidden = true;
+        self.toast_at = Some(Instant::now());
+        if let Some(t) = &self.tray {
+            let _ = t.set_tooltip(Some("CSQTT в трее"));
+        }
+        push_log("[ТРЕЙ] Приложение свёрнуто в трей".into());
+    }
+
+    /// Опрос событий меню/иконки трея + тост-уведомление. Вызывается из update().
+    #[cfg(windows)]
+    fn tray_tick(&mut self, ctx: &egui::Context) {
+        // меню трея
+        while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            match ev.id.0.as_str() {
+                "tray_connect" => {
+                    if self.state == ConnState::Disconnected {
+                        self.start();
+                    }
+                }
+                "tray_disconnect" => {
+                    if matches!(self.state, ConnState::Connected | ConnState::Connecting) {
+                        self.stop();
+                    }
+                }
+                "tray_quit" => {
+                    self.quitting = true;
+                    self.tray = None; // дроп удаляет иконку из трея
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => {}
+            }
+        }
+        // клики по иконке: ЛКМ-up или двойной клик — восстановить окно
+        while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            let restore = match &ev {
+                tray_icon::TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } => {
+                    *button == tray_icon::MouseButton::Left
+                        && *button_state == tray_icon::MouseButtonState::Up
+                }
+                tray_icon::TrayIconEvent::DoubleClick { button, .. } => {
+                    *button == tray_icon::MouseButton::Left
+                }
+                _ => false,
+            };
+            if restore && self.tray_hidden {
+                self.tray_hidden = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                if let Some(t) = &self.tray {
+                    let _ = t.set_tooltip(Some("CSQTT"));
+                }
+                ctx.request_repaint();
+            }
+        }
+        // тост «CSQTT работает в трее» — borderless always-on-top, ~3.5 с
+        if let Some(at) = self.toast_at {
+            let expired = at.elapsed().as_secs_f32() >= 3.5;
+            let vp = egui::ViewportId::from_hash_of("csqtt-tray-toast");
+            let builder = egui::ViewportBuilder::default()
+                .with_title("CSQTT")
+                .with_inner_size([340.0, 100.0])
+                .with_decorations(false)
+                .with_always_on_top();
+            ctx.show_viewport_immediate(vp, builder, |c, _class| {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(th().CARD)
+                            .stroke(Stroke::new(1.0, th().CARD_BORDER))
+                            .corner_radius(egui::CornerRadius::same(14))
+                            .inner_margin(Margin::same(14)),
+                    )
+                    .show(c, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("CSQTT работает в трее")
+                                    .strong()
+                                    .size(15.0)
+                                    .color(th().ON_BG),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("иконка рядом с часами · клик по ней — открыть")
+                                    .size(12.0)
+                                    .color(th().ON_SURF_VAR),
+                            );
+                        });
+                    });
+                if expired {
+                    c.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            if expired {
+                self.toast_at = None;
             }
         }
     }
@@ -2290,6 +2460,15 @@ impl eframe::App for App {
         ctx.set_visuals(visuals);
 
         self.drain_channels();
+
+        // трей (Windows): события иконки/меню + тост; затем перехват закрытия
+        // окна — если это не «Выйти» из трея, отменяем закрытие и сворачиваем
+        #[cfg(windows)]
+        self.tray_tick(ctx);
+        #[cfg(windows)]
+        if !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+            self.tray_on_close(ctx);
+        }
 
         if let Some(rx) = &self.vk_rx {
             match rx.try_recv() {

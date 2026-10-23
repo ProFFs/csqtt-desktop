@@ -16,6 +16,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "
 tokio-util = "0.7.19"
 
 [target.'cfg(windows)'.dependencies]
+tray-icon = "0.19"
 webview2-com = "0.39"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
