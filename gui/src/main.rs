@@ -1989,16 +1989,16 @@ impl App {
 
         egui::Window::new("profile")
             .id(egui::Id::new("profile-editor"))
-            .frame(cs_dialog(Margin::same(0)))
+            .frame(cs_dialog(Margin::same(20)))
             .title_bar(false)
             .resizable(false)
             .movable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.set_max_width(380.0);
-                ui.add_space(14.0);
+                // Единая ширина контента 360 + рамка 20 со всех сторон:
+                // все поля растянуты, отступы симметричны, пустого права нет.
+                ui.set_width(360.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(18.0);
                     ui.label(
                         RichText::new("Редактировать профиль")
                             .strong()
@@ -2006,56 +2006,56 @@ impl App {
                             .size(15.0),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(12.0);
                         if icon_button(ui, "close", 34.0).clicked() {
                             close = true;
                         }
                     });
                 });
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.set_width(344.0);
-                    ui.horizontal_wrapped(|ui| {
-                        pill_field(ui, &mut self.store.profiles[idx].name, "Название профиля", 320.0);
-                    });
-                    ui.add_space(8.0);
+                ui.add_space(12.0);
+                let w_all = ui.available_width();
+                pill_field(ui, &mut self.store.profiles[idx].name, "Название профиля", w_all);
+                ui.add_space(8.0);
+                {
+                    let gap = ui.spacing().item_spacing.x;
+                    let ip_w = (w_all - 110.0 - gap).max(140.0);
                     ui.horizontal(|ui| {
-                        pill_field(ui, &mut self.store.profiles[idx].ip, "IP или домен", 200.0);
+                        pill_field(ui, &mut self.store.profiles[idx].ip, "IP или домен", ip_w);
                         pill_field(ui, &mut self.store.profiles[idx].port, "порт", 110.0);
                     });
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        pill_field(ui, &mut self.store.profiles[idx].password, "Пароль", 320.0);
-                    });
-                    ui.add_space(12.0);
-                    power_dots(ui, &mut self.store.profiles[idx].power, max_power, &mut || {});
-                });
+                }
+                ui.add_space(8.0);
+                pill_field(ui, &mut self.store.profiles[idx].password, "Пароль", w_all);
+                ui.add_space(12.0);
+                power_dots(ui, &mut self.store.profiles[idx].power, max_power, &mut || {});
                 ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(18.0);
-                    if pill_button(ui, "Готово", Vec2::new(104.0, 40.0)).clicked() {
-                        close = true;
-                    }
-                    if ui
-                        .add_sized(
-                            Vec2::new(104.0, 40.0),
-                            egui::Button::new(
-                                RichText::new("Удалить")
-                                    .strong()
-                                    .color(th().ON_ERR_CONT)
-                                    .size(13.0),
+                {
+                    let off = ((w_all - (104.0 * 2.0 + 12.0)) / 2.0).max(0.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(off);
+                        if pill_button(ui, "Готово", Vec2::new(104.0, 40.0)).clicked() {
+                            close = true;
+                        }
+                        ui.add_space(12.0);
+                        if ui
+                            .add_sized(
+                                Vec2::new(104.0, 40.0),
+                                egui::Button::new(
+                                    RichText::new("Удалить")
+                                        .strong()
+                                        .color(th().ON_ERR_CONT)
+                                        .size(13.0),
+                                )
+                                .fill(th().ERR_CONT)
+                                .corner_radius(20.0),
                             )
-                            .fill(th().ERR_CONT)
-                            .corner_radius(20.0),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        deleted = true;
-                    }
-                    ui.add_space(18.0);
-                });
-                ui.add_space(16.0);
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            deleted = true;
+                        }
+                    });
+                }
+                ui.add_space(4.0);
             });
 
         if close || deleted {
