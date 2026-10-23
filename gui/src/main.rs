@@ -486,9 +486,10 @@ fn install_embedded_wintun() {}
 fn is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{
-        GetTokenInformation, OpenProcessToken, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
-    use windows::Win32::System::Threading::GetCurrentProcess;
+    // В windows-rs 0.62 OpenProcessToken экспортируется из Win32::System::Threading
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
         let mut token = windows::Win32::Foundation::HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
