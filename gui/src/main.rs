@@ -1517,7 +1517,7 @@ impl App {
         // Нативное уведомление Windows (ошибки игнорируем — egui-тост ниже
         // остаётся фолбэком, теперь он реально отрисуется: цикл жив).
         let _ = notify_rust::Notification::new()
-            .app_name("csqtt-desktop")
+            .appname("csqtt-desktop")
             .summary("csqtt-desktop")
             .body("Приложение свёрнуто в трей — иконка рядом с часами")
             .show();
@@ -1585,10 +1585,13 @@ impl App {
             if restore && self.tray_hidden {
                 self.tray_hidden = false;
                 // Возврат из «off-screen hide»: размер по умолчанию 560×880,
-                // центр экрана, фокус. Visible(true) не нужен — окно и так
-                // было видимым для Windows.
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 880.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Center);
+                // центр экрана, фокус. ViewportCommand::Center в egui 0.31
+                // нет — центрируем вручную через OuterPosition. Visible(true)
+                // не нужен — окно и так было видимым для Windows.
+                let sz = egui::vec2(560.0, 880.0);
+                let center = ctx.screen_rect().center() - sz * 0.5;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(center));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint();
             }
