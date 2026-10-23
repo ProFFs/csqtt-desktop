@@ -28,7 +28,7 @@ use theme::th;
 const EVENT_PREFIX: &str = "__CSQTT_EVENT__|";
 const VK_AUTH_URL: &str = "https://oauth.vk.ru/authorize?client_id=7793118&scope=1073737727\
     &redirect_uri=https%3A%2F%2Foauth.vk.ru%2Fblank.html&display=page&response_type=token\
-    &revoke=1&v=5.199";
+    &v=5.199";
 const VK_API: &str = "https://api.vk.ru/method/";
 const DEFAULT_CLIENT_IDS: &str = "8202606,6287487";
 const LISTEN: &str = "127.0.0.1:9000";
@@ -212,6 +212,9 @@ enum ConnState {
 enum UiEvent {
     State(ConnState),
     Alert(String),
+    PasteTokenOpen,
+    PasteTokenSaved,
+    ConnectError(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -309,6 +312,30 @@ fn http_client() -> primp::Client {
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| primp::Client::new())
+}
+
+/// Проверка токена по ответу users.get: Some(true) — валиден,
+/// Some(false) — VK ответил error_code 5 (authorization failed),
+/// None — сетевая/иная ошибка (невалидным не считаем).
+fn parse_users_get_check(body: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("response").is_some() {
+        return Some(true);
+    }
+    match v.get("error_code").and_then(|c| c.as_i64()) {
+        Some(5) => Some(false),
+        _ => None,
+    }
+}
+
+async fn vk_token_check(client: &primp::Client, raw: &str) -> Option<bool> {
+    let url = format!(
+        "{VK_API}users.get?v=5.199&{}{raw}",
+        concat!("access", "_token=")
+    );
+    let resp = client.get(url).send().await.ok()?;
+    let text = resp.text().await.ok()?;
+    parse_users_get_check(&text)
 }
 
 async fn vk_api_post(
@@ -1097,6 +1124,12 @@ impl App {
             match ev {
                 UiEvent::State(s) => self.state = s,
                 UiEvent::Alert(msg) => self.alert = Some(msg),
+                UiEvent::PasteTokenOpen => self.paste_open = true,
+                UiEvent::PasteTokenSaved => {
+                    self.paste_open = false;
+                    self.paste_text.clear();
+                }
+                UiEvent::ConnectError(e) => self.connect_error = Some(e),
             }
         }
     }
@@ -1121,14 +1154,17 @@ impl App {
 
     fn start(&mut self) {
         let Some(profile) = self.active_profile() else {
+            push_log("[СТАРТ] нет профиля — добавьте его кнопкой «+ Добавить»".into());
             self.alert = Some("Нет профиля — добавьте его кнопкой «+ Добавить»".into());
             return;
         };
         if profile.ip.trim().is_empty() || profile.port.trim().is_empty() {
+            push_log("[СТАРТ] не заполнены IP и порт профиля".into());
             self.alert = Some("Заполните IP и порт в профиле".into());
             return;
         }
         if profile.password.trim().is_empty() {
+            push_log("[СТАРТ] не заполнен пароль профиля".into());
             self.alert = Some("Заполните пароль профиля".into());
             return;
         }
@@ -1153,6 +1189,7 @@ impl App {
             match read_vk_token() {
                 Some(t) => t,
                 None => {
+                    push_log("[СТАРТ] нет токена ВК — нужен вход (Настройки → Аккаунт ВКонтакте)".into());
                     self.alert =
                         Some("Нужен токен ВК: Настройки → Аккаунт ВКонтакте → Логин".into());
                     return;
@@ -1164,6 +1201,7 @@ impl App {
 
         let mut vk_value = s.custom_hashes.trim().to_string();
         if hash_mode == "manual" && vk_value.is_empty() {
+            push_log("[СТАРТ] ручной режим хешей: список хешей пуст".into());
             self.alert = Some("Ручной режим хешей: заполни хеши в Настройках".into());
             return;
         }
@@ -1272,6 +1310,7 @@ impl App {
             let result = csqtt_core::run_client(config, Some(cancel)).await;
             if let Err(e) = &result {
                 push_log(format!("[КЛИЕНТ] Остановка: {e}"));
+                let _ = ui_tx.send(UiEvent::ConnectError(e.to_string()));
             }
             let _ = ui_tx.send(UiEvent::State(ConnState::Disconnected));
         });
@@ -1608,7 +1647,7 @@ impl App {
                 (th().ON_SURF_VAR.linear_multiply(0.6), "токен не установлен")
             };
             ui.label(RichText::new(format!("● {txt}")).color(dot).size(12.0));
-            if self.paste_open && !has_token {
+            if self.paste_open {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let mut txt = self.paste_text.clone();
@@ -1621,14 +1660,48 @@ impl App {
                     let ok = pill_button(ui, "Сохранить", Vec2::new(104.0, 36.0)).clicked();
                     self.paste_text = txt;
                     if ok {
-                        let t = self.paste_text.clone();
-                        if save_vk_token(&t) {
-                            self.paste_text.clear();
-                            self.paste_open = false;
-                            self.alert = Some("Токен ВКонтакте сохранён".into());
-                        } else {
-                            self.alert = Some("Не удалось разобрать токен".into());
-                        }
+                        let raw = self.paste_text.clone();
+                        let client = http_client();
+                        let ui_tx = self.ui_tx.clone();
+                        self.rt.spawn(async move {
+                            let key = concat!("access", "_token=");
+                            let r = raw.trim();
+                            let parsed = match r.find(key) {
+                                Some(pos) => r[pos + key.len()..]
+                                    .split(['&', '#', ' '])
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string(),
+                                None => r.to_string(),
+                            };
+                            if parsed.is_empty() {
+                                let _ = ui_tx.send(UiEvent::Alert(
+                                    "Не удалось разобрать токен".into(),
+                                ));
+                                return;
+                            }
+                            match vk_token_check(&client, &parsed).await {
+                                Some(false) => {
+                                    let _ = ui_tx.send(UiEvent::Alert(
+                                        "Токен не прошёл проверку VK".into(),
+                                    ));
+                                }
+                                _ => {
+                                    if save_vk_token(&parsed) {
+                                        let _ = ui_tx.send(UiEvent::PasteTokenSaved);
+                                        let _ = ui_tx.send(UiEvent::Alert(
+                                            "Токен ВКонтакте сохранён".into(),
+                                        ));
+                                    } else {
+                                        let _ = ui_tx.send(UiEvent::Alert(
+                                            "Не удалось сохранить токен".into(),
+                                        ));
+                                    }
+                                }
+                            }
+                        });
+                        ui.ctx().request_repaint_after(Duration::from_millis(600));
                     }
                 });
             }
@@ -2118,14 +2191,48 @@ impl eframe::App for App {
             match rx.try_recv() {
                 Ok(Ok(tok)) => {
                     self.vk_rx = None;
-                    // молча сохраняем: окошко само закрылось, всплывать нечем
-                    if !save_vk_token(&tok) {
-                        self.alert = Some("Не удалось сохранить токен".into());
-                    }
+                    // молча: сначала проверяем токен через VK API, пишем только валидный
+                    let client = http_client();
+                    let ui_tx = self.ui_tx.clone();
+                    self.rt.spawn(async move {
+                        match vk_token_check(&client, &tok).await {
+                            Some(false) => {
+                                let _ = ui_tx.send(UiEvent::Alert(
+                                    "Полученный токен не прошёл проверку VK — вставь вручную"
+                                        .into(),
+                                ));
+                                let _ = ui_tx.send(UiEvent::PasteTokenOpen);
+                            }
+                            None => {
+                                push_log(
+                                    "[ВК] токен не удалось проверить VK (сеть) — сохраняем как есть"
+                                        .into(),
+                                );
+                                if !save_vk_token(&tok) {
+                                    let _ = ui_tx.send(UiEvent::Alert(
+                                        "Не удалось сохранить токен".into(),
+                                    ));
+                                }
+                            }
+                            Some(true) => {
+                                if save_vk_token(&tok) {
+                                    let _ = ui_tx.send(UiEvent::Alert(
+                                        "Токен ВКонтакте сохранён".into(),
+                                    ));
+                                } else {
+                                    let _ = ui_tx.send(UiEvent::Alert(
+                                        "Не удалось сохранить токен".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(600));
                 }
                 Ok(Err(e)) => {
                     self.vk_rx = None;
                     self.alert = Some(e);
+                    self.paste_open = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vk_rx = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -2269,6 +2376,29 @@ fn force_dpi_awareness() {}
 
 
 // ───────────────────────────── UI-тесты (egui_kittest) ─────────────────────────────
+#[cfg(test)]
+mod token_check_tests {
+    use super::parse_users_get_check;
+
+    #[test]
+    fn users_get_check_valid_invalid_unknown() {
+        assert_eq!(
+            parse_users_get_check(r#"{"response":[{"id":1,"first_name":"x"}]}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_users_get_check(r#"{"error_code":5,"error_text":"User authorization failed"}"#),
+            Some(false)
+        );
+        assert_eq!(parse_users_get_check("не json"), None);
+        assert_eq!(parse_users_get_check(""), None);
+        assert_eq!(
+            parse_users_get_check(r#"{"error_code":6,"error_text":"too many requests"}"#),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod ui_tests {
     use super::*;
