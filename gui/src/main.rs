@@ -1560,8 +1560,14 @@ impl App {
                 }
                 "tray_quit" => {
                     self.quitting = true;
+                    if let Some(session) = self.session.take() {
+                        session.cancel.cancel();
+                    }
                     self.tray = None; // дроп удаляет иконку из трея
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Штатный Close ждёт, пока tokio-рантайм дождётся
+                    // блокирующих wintun/TUN-циклов ядра — поэтому выход
+                    // «очень долгий». Выходим сразу: OS сама закроет хендлы.
+                    std::process::exit(0);
                 }
                 _ => {}
             }
@@ -2344,7 +2350,10 @@ impl App {
         cs_card(Margin::symmetric(SP, SP)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("csqtt-desktop · v1.1 (ядро csqtt 2.5.0)")
+                RichText::new(format!(
+                    "csqtt-desktop · v{} (ядро csqtt 2.5.0)",
+                    env!("CARGO_PKG_VERSION")
+                ))
                     .strong()
                     .color(th().ON_SURF)
                     .size(14.5),
