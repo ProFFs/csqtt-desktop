@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 // ───────────────────────────── палитра ─────────────────────────────
 // Сине-серая тема (светлая/тёмная по системе) живёт в theme.rs; доступ: th().ИМЯ.
 
+mod sysproxy;
 mod theme;
 mod vk_login;
 
@@ -684,6 +685,7 @@ fn pill_field(ui: &mut egui::Ui, value: &mut String, hint: &str, width: f32) {
 
 /// CsqttBanner (pill surface + icon dot).
 fn banner(ui: &mut egui::Ui, text: &str, cont: Color32, fg: Color32) -> egui::Response {
+    // [v1.5.1] текст баннера переносится в границах ширины, не раздувает ряд
     let ir = Frame::new()
         .fill(cont)
         .corner_radius(CornerRadius::same(18))
@@ -691,7 +693,11 @@ fn banner(ui: &mut egui::Ui, text: &str, cont: Color32, fg: Color32) -> egui::Re
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("!").strong().color(fg).size(14.0));
-                ui.label(RichText::new(text).color(fg).size(12.5));
+                let text_w = (ui.available_width() - 8.0).max(60.0);
+                ui.vertical(|ui| {
+                    ui.set_width(text_w);
+                    ui.add(egui::Label::new(RichText::new(text).color(fg).size(12.5)).wrap());
+                });
             });
         });
     ir.response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -772,11 +778,20 @@ fn separator(ui: &mut egui::Ui) {
 
 /// CsqttSettingRow: title+description left, control right.
 fn setting_row(ui: &mut egui::Ui, title: &str, desc: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
+    // [v1.5.1] фикс рендера: колонка подписи gets width = доступная ширина
+    // минус правый переключатель, иначе длинный label + switch раздувают
+    // горизонтальный ряд за пределы ScrollArea (смещение переживало resize).
+    const RIGHT_RESERVE: f32 = 172.0; // switch_pill ~150 + запас
+    let left_w = (ui.available_width() - RIGHT_RESERVE).max(120.0);
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
+            ui.set_width(left_w);
             ui.label(RichText::new(title).strong().color(th().ON_SURF).size(14.5));
             if let Some(d) = desc {
-                ui.label(RichText::new(d).color(th().ON_SURF_VAR).size(11.5));
+                ui.add(
+                    egui::Label::new(RichText::new(d).color(th().ON_SURF_VAR).size(11.5))
+                        .wrap(),
+                );
             }
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1038,6 +1053,12 @@ struct App {
     /// анимации центральной кнопки; при None анимации нет
     state_anim_at: Option<Instant>,
     anim_prev_state: ConnState,
+    /// [v1.5.1] proxy-режим текущей сессии (ставится в start(), читается в
+    /// sysproxy_check: системный прокси включаем только для proxy-сессий).
+    proxy_session: bool,
+    /// [v1.5.1] снимок HKCU Internet Settings до включения нашего прокси;
+    /// Some — прокси активен, при Disconnected/выходе восстанавливаем.
+    sysproxy: Option<sysproxy::SysProxyBackup>,
     dark: bool,
     vk_rx: Option<Receiver<Result<String, String>>>,
     /// Иконка системного трея (Windows); создаётся при первом сворачивании.
@@ -1096,6 +1117,8 @@ impl App {
             connected_at: None,
             state_anim_at: None,
             anim_prev_state: ConnState::Disconnected,
+            proxy_session: false,
+            sysproxy: None,
             dark,
             vk_rx: None,
             #[cfg(windows)]
@@ -1340,6 +1363,8 @@ impl App {
         let auto_api = hash_mode == "auto_api";
         let hash_mode_owned = hash_mode.to_string();
         let adv = s.clone();
+        // [v1.5.1] метка для sysproxy_check: системный прокси — только proxy-сессии
+        self.proxy_session = s.proxy_mode;
 
         self.session = Some(Session {
             cancel: cancel.clone(),
@@ -1437,6 +1462,40 @@ impl App {
             }
             let _ = ui_tx.send(UiEvent::State(ConnState::Disconnected));
         });
+    }
+
+    /// [v1.5.1] При Connected proxy-сессии — включить системный прокси Windows
+    /// (HKCU, без админ-прав), сохранив прежние значения. Повторный вызов
+    /// безвреден. Вызывается из update() — события STATS приходят из ядра.
+    fn sysproxy_check(&mut self) {
+        if !self.proxy_session || self.sysproxy.is_some() {
+            return;
+        }
+        if self.state != ConnState::Connected {
+            return;
+        }
+        // Порты: SOCKS5 = listen (GUI его и просил ядру), HTTP = из ядра
+        // (proxy_ports), фолбэк — listen+1.
+        let raw = self.settings().listen;
+        let raw = raw.trim();
+        let listen = if raw.is_empty() { LISTEN.to_string() } else { raw.to_string() };
+        let socks_port = listen
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap_or(9000);
+        let http_port = csqtt_core::proxy_ports()
+            .map(|(_, http)| http)
+            .or_else(|| socks_port.checked_add(1))
+            .unwrap_or(socks_port);
+        self.sysproxy = sysproxy::apply(socks_port, http_port);
+    }
+
+    /// [v1.5.1] Откат системного прокси (однократно; без прокси-сессии — no-op).
+    fn sysproxy_restore(&mut self) {
+        if let Some(backup) = self.sysproxy.take() {
+            sysproxy::restore(&backup);
+        }
+        self.proxy_session = false;
     }
 
     fn stop(&mut self) {
@@ -1584,6 +1643,8 @@ impl App {
                     if let Some(session) = self.session.take() {
                         session.cancel.cancel();
                     }
+                    // [v1.5.1] системный прокси — откатить до мгновенного exit
+                    self.sysproxy_restore();
                     self.tray = None; // дроп удаляет иконку из трея
                     // Штатный Close ждёт, пока tokio-рантайм дождётся
                     // блокирующих wintun/TUN-циклов ядра — поэтому выход
@@ -2122,7 +2183,7 @@ impl App {
                 ui.add_space(8.0);
                 banner(
                     ui,
-                    "SOCKS5 127.0.0.1 — пропиши прокси в браузере; права администратора не нужны",
+                    "системный прокси включается сам (браузер заработает)",
                     th().SURF_VAR,
                     th().ON_SURF_VAR,
                 );
@@ -2565,6 +2626,14 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// [v1.5.1] Страховка: если процесс завершается с активным системным
+    /// прокси (закрытое окно без трея, shutdown ОС) — вернуть реестр как было.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.sysproxy.is_some() {
+            self.sysproxy_restore();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut visuals = if self.dark {
             egui::Visuals::dark()
@@ -2585,6 +2654,13 @@ impl eframe::App for App {
         ctx.set_visuals(visuals);
 
         self.drain_channels();
+
+        // [v1.5.1] proxy-режим: включить системный прокси на Connected,
+        // откатить на Disconnected (любым путём: UI-событие, STOPPED, ERROR).
+        self.sysproxy_check();
+        if self.state == ConnState::Disconnected && self.sysproxy.is_some() {
+            self.sysproxy_restore();
+        }
 
         // трей (Windows): события иконки/меню + тост; затем перехват закрытия
         // окна — если это не «Выйти» из трея, отменяем закрытие и сворачиваем
@@ -2680,10 +2756,38 @@ impl eframe::App for App {
                 Page::Connect => self.ui_connect(ui),
                 Page::Logs => self.ui_logs(ui),
                 Page::Settings => {
+                    // [v1.5.1] фикс «обрезки справа при resize»: у vertical-
+                    // ScrollArea горизонтальный offset не клампится, и одна
+                    // непереносимая строка однажды сдвигала весь контент —
+                    // смещение переживало изменение размера окна. Лечим двумя
+                    // уровнями: (1) сбрасываем offset.x с фиксированным id_salt,
+                    // (2) фиксируем ширину контента + режем clip — переполнение
+                    // больше не может сдвинуть отрисовку.
+                    let scroll_id = ui.make_persistent_id("settings-scroll");
+                    ui.ctx().data_mut(|d| {
+                        if let Some(mut state) =
+                            d.get_temp::<egui::containers::scroll_area::State>(scroll_id)
+                        {
+                            if state.offset.x != 0.0 {
+                                state.offset.x = 0.0;
+                                d.insert_temp(scroll_id, state);
+                            }
+                        }
+                    });
                     ScrollArea::vertical()
+                        .id_salt("settings-scroll")
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| self.ui_settings(ui));
+                        .show(ui, |ui| {
+                            let width = ui.available_width();
+                            let clip = ui.clip_rect();
+                            ui.set_max_width(width);
+                            ui.set_clip_rect(Rect::from_min_max(
+                                clip.min,
+                                egui::pos2(clip.min.x + width, clip.max.y),
+                            ));
+                            self.ui_settings(ui);
+                        });
                 }
                 Page::Info => {
                     ScrollArea::vertical()
@@ -2811,10 +2915,14 @@ mod ui_tests {
     use egui_kittest::Harness;
 
     fn harness<'a>() -> Harness<'a, App> {
+        harness_with_size(Vec2::new(560.0, 900.0))
+    }
+
+    fn harness_with_size<'a>(size: Vec2) -> Harness<'a, App> {
         theme::install(true);
         isolate_data_dir();
         Harness::builder()
-            .with_size(Vec2::new(560.0, 900.0))
+            .with_size(size)
             // фоновый request_repaint_after(60ms) в update() иначе бесконечно
             // продлевает жизнь try_run(): шаг должен быть короче таймера.
             .with_step_dt(0.01)
@@ -2974,6 +3082,23 @@ mod ui_tests {
         h.get_by_label_contains("Проверять хеши ВК:").click();
         h.run_steps(2);
         assert_eq!(settings(&h).validate_hashes, !before);
+    }
+
+    // [v1.5.1] широкое окно: контент настроек не обрезан и не смещён
+    #[test]
+    fn settings_wide_viewport_no_clipping() {
+        let mut h = harness_with_size(Vec2::new(900.0, 1300.0));
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(4);
+        // сегмент прокси виден целиком на широком окне
+        assert!(h.query_by_label("Прокси (браузер)").is_some());
+        // ни один узел не вылез за левый край окна (сдвиг контента = баг)
+        for node in h.query_all_by(|n| n.raw_bounds().is_some()) {
+            let b = node.raw_bounds().unwrap();
+            assert!(b.x0 >= -0.5, "узел {b:?} уехал за левый край");
+        }
+        snap(&mut h, "settings_wide");
     }
 
     // [v1.5] сегмент «Режим трафика»: VPN ↔ Прокси (SOCKS5)
