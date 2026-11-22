@@ -151,6 +151,9 @@ struct Settings {
     ip_routing: bool,
     ip_whitelist: bool,
     direct_ips: String,
+    /// [v1.5] Режим трафика: false = VPN (wintun-туннель, нужны права админа),
+    /// true = Прокси (SOCKS5 127.0.0.1, браузеру — прописывать в настройках).
+    proxy_mode: bool,
 }
 
 impl Default for Settings {
@@ -177,6 +180,7 @@ impl Default for Settings {
             ip_routing: false,
             ip_whitelist: false,
             direct_ips: String::new(),
+            proxy_mode: false,
         }
     }
 }
@@ -1253,7 +1257,10 @@ impl App {
     }
 
     fn start(&mut self) {
-        if !is_elevated() {
+        // [v1.5] Права администратора нужны только TUN-режиму; SOCKS5-прокси
+        // живёт на loopback и запускается без элевации.
+        let proxy_mode = self.settings().proxy_mode;
+        if !proxy_mode && !is_elevated() {
             self.alert = Some(
                 "Нужен запуск от администратора: закрой программу, нажми правой кнопкой на csqtt-desktop.exe \u{2192} \u{ab}Запуск от имени администратора\u{bb}".into(),
             );
@@ -1400,7 +1407,15 @@ impl App {
                 srtp_mode: adv.srtp_mode.clone(),
                 generation,
                 salt,
-                tun_uds: if cfg!(windows) { "wintun" } else { "tun" }.to_string(),
+                // [v1.5] proxy-режим: TUN не поднимаем (пустой tun_uds →
+                // ядро идёт в UDP-proxy ветку + SOCKS5-листенер).
+                tun_uds: if proxy_mode {
+                    String::new()
+                } else if cfg!(windows) {
+                    "wintun".to_string()
+                } else {
+                    "tun".to_string()
+                },
                 validate_vk_hashes: adv.validate_hashes,
                 vk_js_token: vk_token_for_core,
                 domain_routing: adv.domain_routing,
@@ -1412,6 +1427,7 @@ impl App {
                 ip_routing: adv.ip_routing,
                 ip_whitelist: adv.ip_whitelist,
                 direct_ips: adv.direct_ips.trim().to_string(),
+                proxy_mode,
             };
 
             let result = csqtt_core::run_client(config, Some(cancel)).await;
@@ -1727,6 +1743,19 @@ impl App {
             }
             ui.add_space(14.0);
             ui.label(RichText::new(status.0).strong().color(status.1).size(14.5));
+            // [v1.5] в proxy-режиме — адрес SOCKS5-прокси под статусом
+            if self.settings().proxy_mode {
+                let listen = {
+                    let raw = self.settings().listen;
+                    let raw = raw.trim();
+                    if raw.is_empty() { LISTEN.to_string() } else { raw.to_string() }
+                };
+                ui.label(
+                    RichText::new(format!("SOCKS5: {listen}"))
+                        .color(th().ON_SURF_VAR)
+                        .size(12.0),
+                );
+            }
             let up = self
                 .connected_at
                 .map(|t| format_uptime(t.elapsed().as_secs()))
@@ -2073,6 +2102,30 @@ impl App {
             if need_work_token && !has_token {
                 ui.add_space(8.0);
                 banner(ui, "требуется авторизация ВКонтакте", th().WARN_CONT, th().ON_WARN_CONT);
+            }
+            separator(ui);
+
+            // [v1.5] Режим трафика: VPN (wintun, нужен админ) или SOCKS5-прокси
+            setting_label(ui, "Режим трафика");
+            let cur_traffic = if s.proxy_mode { "Прокси (браузер)" } else { "VPN (туннель)" };
+            segmented(
+                ui,
+                "traffic",
+                cur_traffic,
+                &seg_opts(&["VPN (туннель)", "Прокси (браузер)"]),
+                &mut |v: &str| {
+                    changed = true;
+                    s.proxy_mode = v == "Прокси (браузер)";
+                },
+            );
+            if s.proxy_mode {
+                ui.add_space(8.0);
+                banner(
+                    ui,
+                    "SOCKS5 127.0.0.1 — пропиши прокси в браузере; права администратора не нужны",
+                    th().SURF_VAR,
+                    th().ON_SURF_VAR,
+                );
             }
             separator(ui);
 
@@ -2921,6 +2974,23 @@ mod ui_tests {
         h.get_by_label_contains("Проверять хеши ВК:").click();
         h.run_steps(2);
         assert_eq!(settings(&h).validate_hashes, !before);
+    }
+
+    // [v1.5] сегмент «Режим трафика»: VPN ↔ Прокси (SOCKS5)
+    #[test]
+    fn traffic_mode_segment_switches_proxy() {
+        let mut h = harness();
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(2);
+        assert!(h.query_by_label("Режим трафика").is_some());
+        assert!(!settings(&h).proxy_mode);
+        h.get_by_label("Прокси (браузер)").click();
+        h.run_steps(2);
+        assert!(settings(&h).proxy_mode);
+        h.get_by_label("VPN (туннель)").click();
+        h.run_steps(2);
+        assert!(!settings(&h).proxy_mode);
     }
 
     #[test]

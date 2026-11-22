@@ -500,9 +500,17 @@ pub struct Dispatcher {
     reassembler: crate::wire_protocol::ShardedReassembler,
     next_frag_id: std::sync::atomic::AtomicU16,
     termination: Arc<OnceLock<Termination>>,
+    // [DESKTOP] SOCKS5-прокси: даунлинк пишется в этот sink вместо UDP-сокета.
+    return_sink: Arc<ArcSwapOption<mpsc::UnboundedSender<PacketBuf>>>,
 }
 
 impl Dispatcher {
+    /// [DESKTOP] Подключить приёмник обратного пути (режим SOCKS5): write_udp
+    /// отдаёт даунлинк-пакеты сюда, UDP-адрес клиента больше не нужен.
+    pub fn set_return_sink(&self, sink: mpsc::UnboundedSender<PacketBuf>) {
+        self.return_sink.store(Some(Arc::new(sink)));
+    }
+
     #[cfg(all(test, unix))]
     pub async fn start_test_tun(
         file: File,
@@ -530,6 +538,7 @@ impl Dispatcher {
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
+            return_sink: Arc::new(ArcSwapOption::empty()),
         });
         let io_dispatcher = dispatcher.clone();
         let task = spawn_critical(
@@ -607,6 +616,7 @@ impl Dispatcher {
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
+            return_sink: Arc::new(ArcSwapOption::empty()),
         });
         crate::log_error!(
             "[КЛИЕНТ] Профиль очередей для {worker_count} потоков: буфер I/O: {} pkts, квант: {} байт",
@@ -1726,6 +1736,33 @@ impl Dispatcher {
         stats: Arc<Stats>,
     ) {
         loop {
+            // [DESKTOP] Режим SOCKS5: даунлинк уходит в return_sink (UDP-адрес
+            // клиента не обязателен — синтетические пакеты приходят из туннеля).
+            if let Some(sink) = self.return_sink.load().as_deref().cloned() {
+                let mut burst = 0usize;
+                loop {
+                    let Some(mut packet) = self.pop_inbound() else {
+                        break;
+                    };
+                    strip_legacy_downlink_prefix(&mut packet);
+                    burst += 1;
+                    stats
+                        .total_bytes_down
+                        .fetch_add(packet.len() as i64, Ordering::Relaxed);
+                    if sink.send(packet).is_err() {
+                        return; // SOCKS5-приёмник закрыт — писатель завершён
+                    }
+                    if burst >= 256 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return,
+                    _ = self.tun_wake.notified() => {},
+                }
+                continue;
+            }
             let Some(address) = client.load().as_deref().copied() else {
                 tokio::select! {
                     biased;
@@ -2046,6 +2083,7 @@ mod tests {
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
+            return_sink: Arc::new(ArcSwapOption::empty()),
         };
 
         let mut p1 = pool.acquire();
@@ -2223,6 +2261,7 @@ mod tests {
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
+            return_sink: Arc::new(ArcSwapOption::empty()),
         };
 
         for i in 0..inbound_capacity {
@@ -2279,6 +2318,7 @@ mod tests {
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
+            return_sink: Arc::new(ArcSwapOption::empty()),
         };
 
         let p_empty = pool.acquire();
@@ -2350,6 +2390,7 @@ mod tests {
             reassembler: crate::wire_protocol::ShardedReassembler::new(),
             next_frag_id: std::sync::atomic::AtomicU16::new(1),
             termination: Arc::new(OnceLock::new()),
+            return_sink: Arc::new(ArcSwapOption::empty()),
         };
 
         let src: SocketAddr = "10.66.67.2:54321".parse().unwrap();

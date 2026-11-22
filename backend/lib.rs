@@ -21,6 +21,8 @@ mod profiles;
 mod repair;
 mod protocol;
 mod session;
+// [DESKTOP] SOCKS5-прокси (режим «Прокси (браузер)») — альтернатива wintun.
+mod socks5;
 mod sni;
 #[path = "shared/spsc_ring.rs"]
 mod spsc_ring;
@@ -113,6 +115,9 @@ pub struct ClientConfig {
     pub ip_routing: bool,
     pub ip_whitelist: bool,
     pub direct_ips: String,
+    /// [DESKTOP] Режим SOCKS5-прокси: без TUN-интерфейса, трафик браузера через
+    /// 127.0.0.1:<listen-порт>; прав администратора не требует.
+    pub proxy_mode: bool,
 }
 
 impl Default for ClientConfig {
@@ -152,6 +157,7 @@ impl Default for ClientConfig {
             ip_routing: false,
             ip_whitelist: false,
             direct_ips: "".to_string(),
+            proxy_mode: false,
         }
     }
 }
@@ -349,7 +355,10 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     let parent_task = start_parent_monitor(cancel.clone());
     events.process(std::process::id());
     let pool = PacketPool::new(packet_pool_size(MAX_WORKERS));
-    let tun_uds = (!arguments.tun_uds.is_empty()).then_some(arguments.tun_uds.clone());
+    // [DESKTOP] proxy_mode: TUN не поднимаем — ядро идёт в UDP-"proxy" ветку
+    // (bind listen), поверх которой поднимается SOCKS5-листенер.
+    let tun_uds = (!arguments.tun_uds.is_empty() && !arguments.proxy_mode)
+        .then(|| arguments.tun_uds.clone());
     let mut direct_domains = crate::sni::parse_direct_domains(&arguments.direct_domains);
     for file_path in &arguments.domains_file {
         if let Ok(content) = std::fs::read_to_string(file_path) {
@@ -376,9 +385,9 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
     // [DESKTOP] Нативный TUN: ядро само создаёт интерфейс и применяет TUNCONF.
     // Windows — «wintun», Linux — имя интерфейса (по умолчанию csqtt).
     #[cfg(windows)]
-    let native_tun = arguments.tun_uds.eq_ignore_ascii_case("wintun");
+    let native_tun = !arguments.proxy_mode && arguments.tun_uds.eq_ignore_ascii_case("wintun");
     #[cfg(target_os = "linux")]
-    let native_tun = !arguments.tun_uds.is_empty();
+    let native_tun = !arguments.proxy_mode && !arguments.tun_uds.is_empty();
     #[cfg(not(any(windows, target_os = "linux")))]
     let native_tun = false;
     let tun_peer_ip = native_tun.then(|| peer.ip().to_string());
@@ -401,6 +410,31 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
             return Err(error);
         }
     };
+    // [DESKTOP] SOCKS5-режим: TCP-листенер на адресе listen + обратный путь
+    // через return_sink вместо UDP-сокета (write_udp проверяет sink первым).
+    if arguments.proxy_mode {
+        let socks_dispatcher = dispatcher.clone();
+        let socks_pool = pool.clone();
+        let socks_stats = Arc::clone(&stats);
+        let port = match crate::socks5::start_socks5(
+            socks_dispatcher,
+            socks_pool,
+            socks_stats,
+            &arguments.listen,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(port) => port,
+            Err(error) => {
+                if let Some(active) = js_calls.take() {
+                    active.finish().await;
+                }
+                return Err(error);
+            }
+        };
+        crate::log_error!("[ПРОКСИ] SOCKS5 127.0.0.1:{port}");
+    }
     let control_task = start_control_input(
         cancel.clone(),
         paused.clone(),
