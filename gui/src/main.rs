@@ -782,16 +782,22 @@ fn setting_row(ui: &mut egui::Ui, title: &str, desc: Option<&str>, content: impl
     // минус правый переключатель, иначе длинный label + switch раздувают
     // горизонтальный ряд за пределы ScrollArea (смещение переживало resize).
     const RIGHT_RESERVE: f32 = 172.0; // switch_pill ~150 + запас
-    let left_w = (ui.available_width() - RIGHT_RESERVE).max(120.0);
+    let avail = ui.available_width();
+    let left_w = (avail - RIGHT_RESERVE).max(120.0);
+    // hint уже title: не шире 280 и не больше 60% ширины страницы
+    let desc_w = left_w.min(280.0).min((avail * 0.6).max(140.0));
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.set_width(left_w);
             ui.label(RichText::new(title).strong().color(th().ON_SURF).size(14.5));
             if let Some(d) = desc {
-                ui.add(
-                    egui::Label::new(RichText::new(d).color(th().ON_SURF_VAR).size(11.5))
-                        .wrap(),
-                );
+                ui.vertical(|ui| {
+                    ui.set_width(desc_w);
+                    ui.add(
+                        egui::Label::new(RichText::new(d).color(th().ON_SURF_VAR).size(11.5))
+                            .wrap(),
+                    );
+                });
             }
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2761,7 +2767,7 @@ impl eframe::App for App {
                     // непереносимая строка однажды сдвигала весь контент —
                     // смещение переживало изменение размера окна. Лечим двумя
                     // уровнями: (1) сбрасываем offset.x с фиксированным id_salt,
-                    // (2) фиксируем ширину контента + режем clip — переполнение
+                    // (2) max_width + фикс ширины контента + clip — переполнение
                     // больше не может сдвинуть отрисовку.
                     let scroll_id = ui.make_persistent_id("settings-scroll");
                     ui.ctx().data_mut(|d| {
@@ -2774,12 +2780,14 @@ impl eframe::App for App {
                             }
                         }
                     });
+                    let outer_w = ui.available_width();
                     ScrollArea::vertical()
                         .id_salt("settings-scroll")
+                        .max_width(outer_w)
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
-                            let width = ui.available_width();
+                            let width = ui.available_width().min(outer_w);
                             let clip = ui.clip_rect();
                             ui.set_max_width(width);
                             ui.set_clip_rect(Rect::from_min_max(
@@ -2790,10 +2798,34 @@ impl eframe::App for App {
                         });
                 }
                 Page::Info => {
+                    // [v1.5.1] та же защита от горизонтального panic, что и Settings
+                    let scroll_id = ui.make_persistent_id("info-scroll");
+                    ui.ctx().data_mut(|d| {
+                        if let Some(mut state) =
+                            d.get_temp::<egui::containers::scroll_area::State>(scroll_id)
+                        {
+                            if state.offset.x != 0.0 {
+                                state.offset.x = 0.0;
+                                d.insert_temp(scroll_id, state);
+                            }
+                        }
+                    });
+                    let outer_w = ui.available_width();
                     ScrollArea::vertical()
+                        .id_salt("info-scroll")
+                        .max_width(outer_w)
                         .auto_shrink([false, false])
                         .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| self.ui_info(ui));
+                        .show(ui, |ui| {
+                            let width = ui.available_width().min(outer_w);
+                            let clip = ui.clip_rect();
+                            ui.set_max_width(width);
+                            ui.set_clip_rect(Rect::from_min_max(
+                                clip.min,
+                                egui::pos2(clip.min.x + width, clip.max.y),
+                            ));
+                            self.ui_info(ui);
+                        });
                 }
             });
 
@@ -3082,6 +3114,30 @@ mod ui_tests {
         h.get_by_label_contains("Проверять хеши ВК:").click();
         h.run_steps(2);
         assert_eq!(settings(&h).validate_hashes, !before);
+    }
+
+    // [v1.5.1] #: горизонтальный offset scroll-area = 0, сегменты в границах
+    #[test]
+    fn wide_overflow_clipped() {
+        let mut h = harness_with_size(Vec2::new(1600.0, 1200.0));
+        h.run_steps(2);
+        h.get_by_label("Настройки").click();
+        h.run_steps(6);
+        let viewport_w = 1600.0;
+        // цель видна и целиком в границах окна (ни обрезки слева, ни справа)
+        let node = h
+            .query_by_label("Прокси (браузер)")
+            .expect("сегмент прокси");
+        let b = node.raw_bounds().expect("bounds");
+        assert!(b.x0 >= -0.5, "левый край {b:?}");
+        assert!(b.x1 <= viewport_w + 0.5, "правый край {b:?}");
+        // ни один узел не за границами вьюпорта — сдвиг/переполнение отсутствуют
+        for n in h.query_all_by(|n| n.raw_bounds().is_some()) {
+            let r = n.raw_bounds().unwrap();
+            assert!(r.x0 >= -0.5, "узел {r:?} уехал за левый край");
+            assert!(r.x1 <= viewport_w + 0.5, "узел {r:?} вылез за правый край");
+        }
+        snap(&mut h, "settings_wide_1600");
     }
 
     // [v1.5.1] широкое окно: контент настроек не обрезан и не смещён
