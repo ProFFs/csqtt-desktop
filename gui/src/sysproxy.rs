@@ -21,7 +21,8 @@ pub struct SysProxyBackup {
 mod imp {
     use super::SysProxyBackup;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HKEY, WIN32_ERROR};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
+    use windows::Win32::System::Registry::HKEY;
     use windows::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
