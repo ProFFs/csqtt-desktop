@@ -843,19 +843,18 @@ fn icon_button(ui: &mut egui::Ui, kind: &str, size: f32) -> egui::Response {
 }
 
 /// Power-символ: дуга с разрывом сверху + штырёк (Material power icon).
-/// В egui 0.31 нет ArcShape, поэтому дуга — полилиния из 28 сегментов.
+/// Дуга — ЕДИНАЯ сглаженная линия из плотных точек: egui тесселит её со
+/// стыками и feathering. Раньше была полилиния из 28 отдельных line_segment
+/// с квадратными торцами — на изгибах торцы торчали «стопкой прямоугольников».
 fn power_glyph(p: &Painter, c: Pos2, r: f32, sw: Stroke) {
     let gap = 0.62f32;
     let a0 = -std::f32::consts::FRAC_PI_2 + gap;
     let a1 = -std::f32::consts::FRAC_PI_2 - gap + std::f32::consts::TAU;
-    let n = 28;
-    let mut prev = c + Vec2::angled(a0) * r;
-    for i in 1..=n {
-        let a = a0 + (a1 - a0) * i as f32 / n as f32;
-        let pt = c + Vec2::angled(a) * r;
-        p.line_segment([prev, pt], sw);
-        prev = pt;
-    }
+    let n = 64usize;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|i| c + Vec2::angled(a0 + (a1 - a0) * i as f32 / n as f32) * r)
+        .collect();
+    p.add(egui::Shape::line(pts, sw));
     p.line_segment(
         [c + Vec2::new(0.0, -(r + sw.width * 2.0)), c + Vec2::new(0.0, -r * 0.18)],
         sw,
@@ -1479,6 +1478,12 @@ impl App {
         self.tray_stats_written = (0, 0, 0);
         let mut b = tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            // ЛКМ — восстановление окна, а не всплывающее меню: иначе клик
+            // «поднимает» меню, а следующее WM_LBUTTONUP из закрытия меню
+            // открывает окно самовызывом («сам вылазит из трея»).
+            // Правый клик всегда показывает меню (это ядро tray-icon, не
+            // настраивается).
+            .with_menu_on_left_click(false)
             // Тултип — ровно «csqtt-desktop», выставляется один раз здесь;
             // больше нигде не меняется (set_tooltip в других местах удалён).
             .with_tooltip("csqtt-desktop");
