@@ -283,7 +283,7 @@ impl ReturnRegistry {
 }
 
 /// Выдача динамического vport из диапазона 2048..=u16::MAX (с обходом занятых).
-fn alloc_vport() -> Option<(u16, mpsc::UnboundedReceiver<Vec<u8>>)> {
+pub(crate) fn alloc_vport() -> Option<(u16, mpsc::UnboundedReceiver<Vec<u8>>)> {
     static NEXT: AtomicU16 = AtomicU16::new(2048);
     let registry = global_registry();
     for _ in 0..60000u32 {
@@ -672,22 +672,23 @@ async fn inject_raw(
 
 // ─────────────────────────── DNS через туннель ───────────────────────────
 
-async fn resolve_via_tunnel(
+pub(crate) async fn resolve_via_tunnel(
     dispatcher: &Arc<Dispatcher>,
     pool: &Arc<PacketPool>,
     stats: &Arc<Stats>,
     name: &str,
     cancel: &CancellationToken,
+    tag: &str,
 ) -> Result<Ipv4Addr> {
     for (index, server) in DNS_SERVERS.iter().enumerate() {
         let server = SocketAddr::new(IpAddr::V4(*server), 53);
         let answer = tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("SOCKS5: резолв отменён"),
+            _ = cancel.cancelled() => bail!("{tag}: резолв отменён"),
             answer = dns_attempt(dispatcher, pool, stats, server, name, cancel) => answer,
             _ = tokio::time::sleep(DNS_PHASE) => {
                 crate::log_error!(
-                    "[SOCKS5] DNS {name} через {server} не ответил (фаза {}/{})",
+                    "[{tag}] DNS {name} через {server} не ответил (фаза {}/{})",
                     index + 1,
                     DNS_SERVERS.len()
                 );
@@ -697,11 +698,11 @@ async fn resolve_via_tunnel(
         match answer {
             Some(ip) => return Ok(ip),
             None => {
-                crate::log_error!("[SOCKS5] DNS {name}: пустой A-ответ от {server}");
+                crate::log_error!("[{tag}] DNS {name}: пустой A-ответ от {server}");
             }
         }
     }
-    bail!("SOCKS5: домен {name} не разрешился через туннель")
+    bail!("{tag}: домен {name} не разрешился через туннель")
 }
 
 async fn dns_attempt(
@@ -869,7 +870,9 @@ async fn handle_connection(
                 stream.write_all(&socks5_reply(REP_ATYP_UNSUPPORTED)).await.ok();
                 bail!("адресная строка IPv6 не поддерживается");
             } else {
-                match resolve_via_tunnel(&dispatcher, &pool, &stats, &host, &cancel).await {
+                match resolve_via_tunnel(&dispatcher, &pool, &stats, &host, &cancel, "SOCKS5")
+                    .await
+                {
                     Ok(ip) => SocketAddr::new(IpAddr::V4(ip), port),
                     Err(error) => {
                         stream.write_all(&socks5_reply(REP_FAILURE)).await.ok();
@@ -879,7 +882,18 @@ async fn handle_connection(
             }
         }
     };
-    run_tcp_session(stream, dispatcher, pool, stats, target, cancel).await
+    run_tcp_session(
+        stream,
+        dispatcher,
+        pool,
+        stats,
+        target,
+        cancel,
+        "SOCKS5",
+        &socks5_reply(REP_SUCCEEDED),
+        &socks5_reply(REP_FAILURE),
+    )
+    .await
 }
 
 /// SOCKS5 greeting: Version 5, без аутентификации, затем CONNECT-запрос.
@@ -954,25 +968,30 @@ async fn handshake(stream: &mut TcpStream) -> Result<SocksRequest> {
     Ok(request)
 }
 
-/// Одна SOCKS5-сессия = один туннельный TCP-поток от VIRT_IP:vport к цели.
-async fn run_tcp_session(
+/// Одна прокси-сессия = один туннельный TCP-поток от VIRT_IP:vport к цели.
+/// `reply_on_established` пишется браузеру сразу после SYN/ACK (SOCKS REP или
+/// HTTP «200 Connection Established»); `fail_reply` — при смерти SYN.
+pub(crate) async fn run_tcp_session(
     mut stream: TcpStream,
     dispatcher: Arc<Dispatcher>,
     pool: Arc<PacketPool>,
     stats: Arc<Stats>,
     target: SocketAddr,
     cancel: CancellationToken,
+    tag: &'static str,
+    reply_on_established: &[u8],
+    fail_reply: &[u8],
 ) -> Result<()> {
     let Some((vport, mut rx)) = alloc_vport() else {
-        stream.write_all(&socks5_reply(REP_FAILURE)).await.ok();
-        bail!("SOCKS5: локальные порты исчерпаны");
+        stream.write_all(fail_reply).await.ok();
+        bail!("{tag}: локальные порты исчерпаны");
     };
     let src = SocketAddr::new(IpAddr::V4(VIRT_IP), vport);
     let registry = global_registry();
     let mut engine = TcpEngine::new(src, target);
     let syn = engine.syn_packet();
     inject_raw(&dispatcher, &pool, &stats, &syn, &cancel).await;
-    crate::log_error!("[SOCKS5] {src} → SYN → {target}");
+    crate::log_error!("[{tag}] {src} → SYN → {target}");
 
     let mut reply_written = false;
     let mut sock_eof = false;
@@ -1016,7 +1035,7 @@ async fn run_tcp_session(
                 for event in events {
                     match event {
                         EngineEvent::Established => {
-                            crate::log_error!("[SOCKS5] {src} ⇄ {target}: ESTABLISHED");
+                            crate::log_error!("[{tag}] {src} ⇄ {target}: ESTABLISHED");
                         }
                         EngineEvent::Data(bytes) => data.extend_from_slice(&bytes),
                         EngineEvent::RemoteClosed => peer_closed = true,
@@ -1025,7 +1044,7 @@ async fn run_tcp_session(
                 let mut broken = false;
                 if engine.state == EngineState::Established && !reply_written {
                     reply_written = true;
-                    if stream.write_all(&socks5_reply(REP_SUCCEEDED)).await.is_err() {
+                    if stream.write_all(reply_on_established).await.is_err() {
                         broken = true;
                     }
                 }
@@ -1048,9 +1067,9 @@ async fn run_tcp_session(
                     inject_raw(&dispatcher, &pool, &stats, &packet, &cancel).await;
                 }
                 if dead {
-                    crate::log_error!("[SOCKS5] {src} → {target}: ретрансмит исчерпан");
+                    crate::log_error!("[{tag}] {src} → {target}: ретрансмит исчерпан");
                     if !reply_written {
-                        stream.write_all(&socks5_reply(REP_FAILURE)).await.ok();
+                        stream.write_all(fail_reply).await.ok();
                     }
                     outcome = "ретрансмит исчерпан";
                     break 'session;
@@ -1078,7 +1097,7 @@ async fn run_tcp_session(
                             )
                             .await;
                         } else {
-                            crate::log_error!("[SOCKS5] {src} → {target}: переполнение uplink-буфера");
+                            crate::log_error!("[{tag}] {src} → {target}: переполнение uplink-буфера");
                             sock_eof = true;
                             if let Some(fin) = engine.push_fin() {
                                 inject_raw(&dispatcher, &pool, &stats, &fin, &cancel).await;
@@ -1093,7 +1112,7 @@ async fn run_tcp_session(
                 }
             }
             _ = tokio::time::sleep_until(fin_at), if fin_deadline.is_some() => {
-                crate::log_error!("[SOCKS5] {src} → {target}: FIN не подтверждён, закрываем");
+                crate::log_error!("[{tag}] {src} → {target}: FIN не подтверждён, закрываем");
                 outcome = "FIN не подтверждён";
                 break 'session;
             }
@@ -1101,7 +1120,7 @@ async fn run_tcp_session(
     }
     let _ = stream.shutdown().await;
     registry.remove(vport);
-    crate::log_error!("[SOCKS5] {src} → {target}: сессия завершена ({outcome})");
+    crate::log_error!("[{tag}] {src} → {target}: сессия завершена ({outcome})");
     Ok(())
 }
 

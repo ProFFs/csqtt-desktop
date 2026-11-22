@@ -1,6 +1,6 @@
 [package]
 name = "csqtt-desktop"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 rust-version = "1.97.1"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -22,6 +22,7 @@ webview2-com = "0.39"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinInet",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",

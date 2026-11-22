@@ -13,6 +13,8 @@ mod dns;
 #[path = "shared/dtls.rs"]
 pub mod dtls;
 mod events;
+// [DESKTOP] HTTP CONNECT-прокси — второй вход proxy-режима (SOCKS5-рядом).
+pub mod http_proxy;
 mod logging;
 mod namegen;
 mod obfs;
@@ -194,6 +196,23 @@ fn clear_control_channel() {
     if let Ok(mut guard) = CONTROL_TX.lock() {
         *guard = None;
     }
+}
+
+/// [DESKTOP] Порти активного proxy-режима: (SOCKS5, HTTP CONNECT). GUI читает
+/// после старта, чтобы настроить системный прокси Windows.
+static PROXY_PORTS: Mutex<Option<(u16, u16)>> = Mutex::new(None);
+
+/// Порты активного SOCKS5/HTTP-прокси (None, если прокси-режим не запущен).
+pub fn proxy_ports() -> Option<(u16, u16)> {
+    *PROXY_PORTS.lock().unwrap()
+}
+
+/// «listen+1»: порт HTTP-прокси от SOCKS-адреса (9000 → 127.0.0.1:9001).
+/// Если listen не разбирается — None (вызывающий использует port+1).
+fn next_listen_port(listen: &str, socks_port: u16) -> Option<String> {
+    let (host, _port) = listen.rsplit_once(':')?;
+    let next = socks_port.checked_add(1)?;
+    Some(format!("{host}:{next}"))
 }
 
 /// Отправить команду управления активной сессии ("PAUSE", "RESUME", "STOP",
@@ -434,6 +453,31 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
             }
         };
         crate::log_error!("[ПРОКСИ] SOCKS5 127.0.0.1:{port}");
+        // HTTP CONNECT-прокси на listen+1 (браузер через системный прокси).
+        let http_listen = next_listen_port(&arguments.listen, port)
+            .unwrap_or_else(|| format!("127.0.0.1:{}", port + 1));
+        let http_dispatcher = dispatcher.clone();
+        let http_pool = pool.clone();
+        let http_stats = Arc::clone(&stats);
+        match crate::http_proxy::start_http_proxy(
+            http_dispatcher,
+            http_pool,
+            http_stats,
+            &http_listen,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(http_port) => {
+                crate::log_error!("[ПРОКСИ] HTTP:{http_port} (CONNECT)");
+                *PROXY_PORTS.lock().unwrap() = Some((port, http_port));
+            }
+            Err(error) => {
+                // HTTP-вход — удобный довесок; SOCKS5 уже работает.
+                crate::log_error!("[ПРОКСИ] HTTP-листенер не поднялся: {error:#}");
+                *PROXY_PORTS.lock().unwrap() = Some((port, port));
+            }
+        }
     }
     let control_task = start_control_input(
         cancel.clone(),
@@ -603,6 +647,7 @@ pub async fn run_client(arguments: ClientConfig, external_cancel: Option<Cancell
         groups_future.await;
     }
     dispatcher.shutdown().await;
+    *PROXY_PORTS.lock().unwrap() = None;
     clear_control_channel();
     clear_active_captcha();
     stats_task.abort();
@@ -1022,6 +1067,19 @@ mod worker_count_tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(!wait_for_js_credential_readiness(receiver, 1, cancel).await);
+    }
+
+    // [DESKTOP] v1.5: порты прокси-режима
+    #[test]
+    fn next_listen_port_bumps_only_the_port() {
+        assert_eq!(
+            next_listen_port("127.0.0.1:9000", 9000).as_deref(),
+            Some("127.0.0.1:9001")
+        );
+        assert_eq!(next_listen_port("127.0.0.1:65535", 65535), None);
+        assert_eq!(next_listen_port("без-двоеточия", 9000), None);
+        // прокси-порты по умолчанию не заняты
+        assert!(proxy_ports().is_none() || proxy_ports().unwrap().0 > 0);
     }
 
     // [DESKTOP] Тесты stdin-bootstrap и clap-аргументов удалены:
