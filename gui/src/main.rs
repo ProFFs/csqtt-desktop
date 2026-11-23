@@ -2807,14 +2807,19 @@ impl eframe::App for App {
                     // уровнями: (1) сбрасываем offset.x с фиксированным id_salt,
                     // (2) max_width + фикс ширины контента + clip — переполнение
                     // больше не может сдвинуть отрисовку.
-                    let scroll_id = ui.make_persistent_id("settings-scroll");
+                    // [v1.5.2] РЕАЛНЫЙ id scroll-области: ScrollArea в egui 0.31
+                    // кладёт state как ui.make_persistent_id(Id::new(salt)) в
+                    // PERSISTED store (get_persisted). Прошлый резет в 1.5.1
+                    // целился в temp-store по другому хешу — no-op, offset.x
+                    // от focus-scroll/touchpad выживал между кадрами и resize.
+                    let scroll_id = ui.make_persistent_id(egui::Id::new("settings-scroll"));
                     ui.ctx().data_mut(|d| {
                         if let Some(mut state) =
-                            d.get_temp::<egui::containers::scroll_area::State>(scroll_id)
+                            d.get_persisted::<egui::containers::scroll_area::State>(scroll_id)
                         {
                             if state.offset.x != 0.0 {
                                 state.offset.x = 0.0;
-                                d.insert_temp(scroll_id, state);
+                                d.insert_persisted(scroll_id, state);
                             }
                         }
                     });
@@ -2828,23 +2833,30 @@ impl eframe::App for App {
                             let width = ui.available_width().min(outer_w);
                             let clip = ui.clip_rect();
                             ui.set_max_width(width);
+                            // [v1.5.2] +2px: штрих рамки на самой границе клипа
+                            // срезался наполовину — «карточка без правой границы»
                             ui.set_clip_rect(Rect::from_min_max(
                                 clip.min,
-                                egui::pos2(clip.min.x + width, clip.max.y),
+                                egui::pos2(clip.min.x + width + 2.0, clip.max.y),
                             ));
                             self.ui_settings(ui);
                         });
                 }
                 Page::Info => {
                     // [v1.5.1] та же защита от горизонтального panic, что и Settings
-                    let scroll_id = ui.make_persistent_id("info-scroll");
+                    // [v1.5.2] РЕАЛНЫЙ id scroll-области: ScrollArea в egui 0.31
+                    // кладёт state как ui.make_persistent_id(Id::new(salt)) в
+                    // PERSISTED store (get_persisted). Прошлый резет в 1.5.1
+                    // целился в temp-store по другому хешу — no-op, offset.x
+                    // от focus-scroll/touchpad выживал между кадрами и resize.
+                    let scroll_id = ui.make_persistent_id(egui::Id::new("info-scroll"));
                     ui.ctx().data_mut(|d| {
                         if let Some(mut state) =
-                            d.get_temp::<egui::containers::scroll_area::State>(scroll_id)
+                            d.get_persisted::<egui::containers::scroll_area::State>(scroll_id)
                         {
                             if state.offset.x != 0.0 {
                                 state.offset.x = 0.0;
-                                d.insert_temp(scroll_id, state);
+                                d.insert_persisted(scroll_id, state);
                             }
                         }
                     });
@@ -2858,9 +2870,11 @@ impl eframe::App for App {
                             let width = ui.available_width().min(outer_w);
                             let clip = ui.clip_rect();
                             ui.set_max_width(width);
+                            // [v1.5.2] +2px: штрих рамки на самой границе клипа
+                            // срезался наполовину — «карточка без правой границы»
                             ui.set_clip_rect(Rect::from_min_max(
                                 clip.min,
-                                egui::pos2(clip.min.x + width, clip.max.y),
+                                egui::pos2(clip.min.x + width + 2.0, clip.max.y),
                             ));
                             self.ui_info(ui);
                         });
