@@ -33,6 +33,9 @@ const VK_AUTH_URL: &str = "https://oauth.vk.ru/authorize?client_id=7793118&scope
 const VK_API: &str = "https://api.vk.ru/method/";
 const DEFAULT_CLIENT_IDS: &str = "8202606,6287487";
 const LISTEN: &str = "127.0.0.1:9000";
+/// [v1.5.1] Единственный источник версии приложения — gui/Cargo.toml.
+/// При каждом релизе менять version ТОЛЬКО там; весь GUI берёт её отсюда.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const WORKERS_PER_GROUP: usize = 9;
 const MAX_VK_HASHES: usize = 6;
 // Единый внутренний отступ секционных карточек (AppSectionCard padding).
@@ -1742,7 +1745,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("CSQTT").strong().color(th().ON_BG).size(21.0));
-                ui.label(RichText::new("v2.5.0 · desktop").color(th().ON_SURF_VAR).size(11.0));
+                ui.label(
+                    RichText::new(format!("v{APP_VERSION} · desktop"))
+                        .color(th().ON_SURF_VAR)
+                        .size(11.0),
+                );
             });
         });
         ui.add_space(12.0);
@@ -2476,8 +2483,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new(format!(
-                    "csqtt-desktop · v{} (ядро csqtt 2.5.0)",
-                    env!("CARGO_PKG_VERSION")
+                    "csqtt-desktop · v{APP_VERSION} (ядро csqtt 2.5.0)"
                 ))
                     .strong()
                     .color(th().ON_SURF)
