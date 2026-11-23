@@ -1076,6 +1076,11 @@ struct App {
     tray: Option<tray_icon::TrayIcon>,
     /// Окно скрыто в трей (закрытие отменено), а не закрыто.
     tray_hidden: bool,
+    // [v1.5.2] реальный размер окна до сворачивания в трей (иначе restore
+    // возвращал хардкод 560×880, а после off-screen hide 1×1 окно могло
+    // вернуться кривым). Плюс стартовая кламповка кривого персистентного размера.
+    tray_saved_size: Option<egui::Vec2>,
+    win_checked: bool,
     /// «Выйти» из меню трея: закрытие больше не перехватываем.
     quitting: bool,
     /// Момент сворачивания в трей — автозакрытие тоста через ~3.5 с.
@@ -1133,6 +1138,8 @@ impl App {
             #[cfg(windows)]
             tray: None,
             tray_hidden: false,
+            tray_saved_size: None,
+            win_checked: false,
             quitting: false,
             #[cfg(windows)]
             toast_at: None,
@@ -1597,6 +1604,8 @@ impl App {
     fn tray_on_close(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         self.make_tray();
+        self.tray_saved_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()))
+            .filter(|sz| sz.x > 100.0 && sz.y > 100.0);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
             32000.0, 32000.0,
         )));
@@ -1685,7 +1694,11 @@ impl App {
                 // центр экрана, фокус. ViewportCommand::Center в egui 0.31
                 // нет — центрируем вручную через OuterPosition. Visible(true)
                 // не нужен — окно и так было видимым для Windows.
-                let sz = egui::vec2(560.0, 880.0);
+                let sz = self
+                    .tray_saved_size
+                    .take()
+                    .unwrap_or(egui::vec2(900.0, 680.0))
+                    .max(egui::vec2(760.0, 560.0));
                 let center = ctx.screen_rect().center() - sz * 0.5;
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(center));
@@ -2647,6 +2660,25 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // [v1.5.2] стартовая самозащита: если окно восстановилось крошечным
+        // или за пределами экранов (битый персистентный geometry после
+        // off-screen hide) — вернуть нормальный размер и посадить на экран.
+        if !self.win_checked && !ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            if let Some(inner) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
+                let offscreen = ctx.input(|i| {
+                    i.viewport().outer_rect.map_or(false, |r| r.min.x > 15000.0 || r.min.y > 15000.0)
+                });
+                self.win_checked = true;
+                if inner.x < 720.0 || inner.y < 500.0 || offscreen {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        900.0, 680.0,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        120.0, 90.0,
+                    )));
+                }
+            }
+        }
         let mut visuals = if self.dark {
             egui::Visuals::dark()
         } else {
@@ -2886,8 +2918,8 @@ fn main() -> eframe::Result {
     theme::install(dark);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 880.0])
-            .with_min_inner_size([520.0, 700.0])
+            .with_inner_size([900.0, 700.0])
+            .with_min_inner_size([720.0, 540.0])
             .with_title("csqtt-desktop"),
         ..Default::default()
     };

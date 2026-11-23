@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "csqtt-desktop"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "accesskit",
  "anyhow",
